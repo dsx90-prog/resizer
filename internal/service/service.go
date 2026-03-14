@@ -5,9 +5,11 @@ import (
 	"image"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"os"
 	imagep "resizer/pkg/image"
+	"strings"
 	"time"
 )
 
@@ -25,8 +27,79 @@ func CheckField(newFilePath string) bool {
 }
 
 func DownloadImage(fileName, imageURL string) (image.Image, error) {
+	resp, err := downloadRequest(imageURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	// Ограничиваем размер скачиваемого файла до 15 МБ для защиты от OOM
+	const maxFileSize = 15 * 1024 * 1024 // 15 MB
+	limitedBody := io.LimitReader(resp.Body, maxFileSize)
+
+	return imagep.DecodeImage(fileName, limitedBody)
+}
+
+// DownloadMeta contains filepath and mime type
+type DownloadMeta struct {
+	FilePath    string
+	ContentType string // e.g: "video/mp4", "image/jpeg"
+	IsVideo     bool
+}
+
+// DownloadToDisk downloads arbitrary file to a given directory, returning metadata
+func DownloadToDisk(imageURL string, destDir string) (*DownloadMeta, error) {
+	resp, err := downloadRequest(imageURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	contentType := resp.Header.Get("Content-Type")
+	contentType, _, _ = mime.ParseMediaType(contentType)
+
+	isVideo := strings.HasPrefix(contentType, "video/")
+	var maxFileSize int64
+	if isVideo {
+		maxFileSize = 200 * 1024 * 1024 // 200 MB limit for videos
+	} else {
+		maxFileSize = 25 * 1024 * 1024 // 25 MB limit for anything else
+	}
+
+	tempFile, err := os.CreateTemp(destDir, "download_*.tmp")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tempFileName := tempFile.Name()
+
+	limitedBody := io.LimitReader(resp.Body, maxFileSize)
+	written, err := io.Copy(tempFile, limitedBody)
+	tempFile.Close() // Close before possible error return
+
+	if err != nil {
+		os.Remove(tempFileName)
+		return nil, fmt.Errorf("failed to download file: %w", err)
+	}
+
+	if written == maxFileSize {
+		os.Remove(tempFileName)
+		return nil, fmt.Errorf("file exceeded size limit format (Video: 200MB, Other: 25MB)")
+	}
+
+	return &DownloadMeta{
+		FilePath:    tempFileName,
+		ContentType: contentType,
+		IsVideo:     isVideo,
+	}, nil
+}
+
+func DownloadStream(imageURL string) (*http.Response, error) {
+	return downloadRequest(imageURL)
+}
+
+func downloadRequest(imageURL string) (*http.Response, error) {
 	client := &http.Client{
-		Timeout: 15 * time.Second, // Жесткий таймаут для всех операций с удаленным сервером
+		Timeout: 30 * time.Second, // Timeout для всех операций с удаленным сервером
 	}
 	req, err := http.NewRequest("GET", imageURL, nil)
 	if err != nil {
@@ -40,17 +113,13 @@ func DownloadImage(fileName, imageURL string) (image.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to download image: status code %d", response.StatusCode)
+		response.Body.Close()
+		return nil, fmt.Errorf("failed to download: status code %d", response.StatusCode)
 	}
 
-	// Ограничиваем размер скачиваемого файла до 15 МБ для защиты от OOM
-	const maxFileSize = 15 * 1024 * 1024 // 15 MB
-	limitedBody := io.LimitReader(response.Body, maxFileSize)
-
-	return imagep.DecodeImage(fileName, limitedBody)
+	return response, nil
 }
 
 func CreateMeta(dir string, updateData string) {

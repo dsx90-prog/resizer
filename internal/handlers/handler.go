@@ -1,10 +1,14 @@
 package handlers
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"image/png"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -13,6 +17,7 @@ import (
 	"path/filepath"
 	"resizer/internal/service"
 	imagep "resizer/pkg/image"
+	videop "resizer/pkg/video"
 	"strconv"
 	"strings"
 	"time"
@@ -21,7 +26,8 @@ import (
 )
 
 var AllowedDomains []string
-var StoragePath string = "artefacts" // Default value
+var StoragePath string = "artefacts"       // Default value
+var VideoProcessingMode string = "chunked" // Default value
 
 func getFileHash(filePath string) string {
 	data, err := os.ReadFile(filePath)
@@ -69,6 +75,9 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 	if q, err := strconv.Atoi(qualityStr); err == nil && q > 0 && q <= 100 {
 		quality = q
 	}
+
+	startSec, _ := strconv.ParseFloat(params.Get("start"), 64)
+	endSec, _ := strconv.ParseFloat(params.Get("end"), 64)
 
 	// Разобрать URL
 	u, err := url.Parse(rawImageURL)
@@ -124,109 +133,371 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 	if quality != 80 {
 		filenameWithoutExtension = fmt.Sprintf("%s_q-%d", filenameWithoutExtension, quality)
 	}
-
-	var ext string
-	if format == "webp" {
-		ext = "webp"
-	} else {
-		ext = "png"
+	if startSec > 0 {
+		filenameWithoutExtension = fmt.Sprintf("%s_start-%.2f", filenameWithoutExtension, startSec)
+	}
+	if endSec > 0 {
+		filenameWithoutExtension = fmt.Sprintf("%s_end-%.2f", filenameWithoutExtension, endSec)
 	}
 
-	newFilePath := filepath.Join(dir, fmt.Sprintf("%s.%s", filenameWithoutExtension, ext))
+	// Сначала мы не знаем точное расширение (mp4/png/webp), поэтому пока просто базовое имя пути к кешу
+	cacheBasePath := filepath.Join(dir, filenameWithoutExtension)
 
-	var downloadTime, processTime time.Duration
+	// Мы пока не знаем формат (video или image), поэтому отправим ответ когда процесс завершится
+	// Но пока проверим, не лежат ли в кеше уже готовые медиафайлы с нужными параметрами
 
-	sendResponse := func() {
-		w.Header().Set("X-Download-Time", downloadTime.String())
-		w.Header().Set("X-Processing-Time", processTime.String())
-		if hash := getFileHash(newFilePath); hash != "" {
-			w.Header().Set("X-Image-Hash", hash)
-		}
-		if format == "webp" {
-			w.Header().Set("Content-Type", "image/webp")
-		} else {
-			w.Header().Set("Content-Type", "image/png")
-		}
-		http.ServeFile(w, r, newFilePath)
+	// Возможные форматы закэшированного результата
+	possibleCacheFiles := []string{
+		cacheBasePath + ".mp4",
+		cacheBasePath + ".png",
+		cacheBasePath + ".webp",
 	}
 
-	// Проверить, существует ли файл в папке
-	if service.CheckField(newFilePath) {
-		if updateData == "" {
-			sendResponse()
-			return
-		}
+	for _, cachedFile := range possibleCacheFiles {
+		if service.CheckField(cachedFile) {
+			if updateData == "" || ReadMeta(metaPath) == updateData {
+				w.Header().Set("X-Cache", "HIT")
 
-		if ReadMeta(metaPath) == updateData {
-			sendResponse()
-			return
-		}
+				if strings.HasSuffix(cachedFile, ".webp") {
+					w.Header().Set("Content-Type", "image/webp")
+				} else if strings.HasSuffix(cachedFile, ".png") {
+					w.Header().Set("Content-Type", "image/png")
+				} else if strings.HasSuffix(cachedFile, ".mp4") {
+					w.Header().Set("Content-Type", "video/mp4")
+				}
 
-		dropOldData(dir)
+				http.ServeFile(w, r, cachedFile)
+				return
+			}
+			dropOldData(dir)
+			break
+		}
 	}
 
 	startDownload := time.Now()
-	// Скачать изображение
-	img, err := service.DownloadImage(fileName, imageURL)
-	downloadTime = time.Since(startDownload)
+
+	// 1. Start downloading stream to identify content
+	resp, err := service.DownloadStream(imageURL)
 	if err != nil {
-		slog.Error("Failed to download image", "url", imageURL, "error", err)
-		http.Error(w, "Failed to download image", http.StatusInternalServerError)
+		slog.Error("Failed to start download stream", "url", imageURL, "error", err)
+		http.Error(w, "Failed to download file", http.StatusInternalServerError)
 		return
 	}
+	defer resp.Body.Close()
 
-	startProcess := time.Now()
-	if width > 0 && height > 0 {
-		img = imagep.ResizedImage(img, width, height, cropX, cropY)
-	}
-	if radius > 0 {
-		img = imagep.RoundImage(img, radius)
-	}
-	processTime = time.Since(startProcess)
+	contentType := resp.Header.Get("Content-Type")
+	isVideo := strings.HasPrefix(contentType, "video/")
 
-	// Сохранить изображение
-	outputFile, err := service.Save(dir, newFilePath)
-	if err != nil {
-		slog.Error("Failed to create output file", "path", newFilePath, "error", err)
+	// Read first 512KB for hashing (Smart Content ID)
+	previewBuf := make([]byte, 512*1024)
+	nBytes, err := io.ReadAtLeast(resp.Body, previewBuf, 1)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		slog.Error("Failed to read header for hashing", "error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
+	previewBuf = previewBuf[:nBytes]
 
-	if format == "webp" {
-		options := webp.Options{Quality: quality}
-		err = webp.Encode(outputFile, img, options)
-		outputFile.Close()
+	// Early hash based on content bits
+	earlyHasher := sha256.New()
+	earlyHasher.Write(previewBuf)
+	contentID := hex.EncodeToString(earlyHasher.Sum(nil))
+
+	// Path based on Content ID deduplication
+	filenameWithContentID := fmt.Sprintf("%s_w-%d_h-%d", contentID, width, height)
+	if radius > 0 {
+		filenameWithContentID = fmt.Sprintf("%s_r-%d", filenameWithContentID, radius)
+	}
+	if quality > 0 {
+		filenameWithContentID = fmt.Sprintf("%s_q-%d", filenameWithContentID, quality)
+	}
+	if startSec > 0 {
+		filenameWithContentID = fmt.Sprintf("%s_start-%.2f", filenameWithContentID, startSec)
+	}
+	if endSec > 0 {
+		filenameWithContentID = fmt.Sprintf("%s_end-%.2f", filenameWithContentID, endSec)
+	}
+	contentCacheBasePath := filepath.Join(dir, filenameWithContentID)
+
+	// Check if we have THIS EXACT CONTENT already processed
+	for _, ext := range []string{".mp4", ".webp", ".png"} {
+		actualCachedFile := contentCacheBasePath + ext
+		if service.CheckField(actualCachedFile) {
+			slog.Info("Cache HIT by Content ID signature", "id", contentID)
+			w.Header().Set("X-Cache", "HIT-ID")
+			if ext == ".mp4" {
+				w.Header().Set("Content-Type", "video/mp4")
+			} else if ext == ".webp" {
+				w.Header().Set("Content-Type", "image/webp")
+			} else {
+				w.Header().Set("Content-Type", "image/png")
+			}
+			http.ServeFile(w, r, actualCachedFile)
+			return
+		}
+	}
+
+	// Combine what we read and what's left in the pipe
+	fullStream := io.MultiReader(bytes.NewReader(previewBuf), resp.Body)
+	downloadTime := time.Since(startDownload)
+
+	startProcess := time.Now()
+	var finalExt string
+	var finalFilePath string
+
+	if isVideo {
+		finalExt = "mp4"
+		finalFilePath = contentCacheBasePath + "." + finalExt
+		service.CreateDirectory(dir)
+
+		opts := videop.ProcessOptions{
+			Width:   width,
+			Height:  height,
+			Quality: quality,
+			Start:   startSec,
+			End:     endSec,
+		}
+
+		if VideoProcessingMode == "stream" {
+			slog.Info("Starting STREAMING video processing", "url", imageURL)
+			w.Header().Set("Content-Type", "video/mp4")
+			w.Header().Set("X-Processing-Mode", "stream")
+
+			// Write simultaneously to response and cache file
+			cacheFile, err := os.Create(finalFilePath)
+			if err != nil {
+				slog.Error("Failed to create cache file", "error", err)
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+			defer cacheFile.Close()
+
+			mw := io.MultiWriter(w, cacheFile)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+
+			if err := videop.StreamVideo(ctx, fullStream, mw, opts); err != nil {
+				slog.Error("Streaming video failed", "error", err)
+				return
+			}
+			return // Stream finished and sent
+		} else {
+			slog.Info("Starting CHUNKED video processing", "url", imageURL)
+			// Chunked mode needs file on disk
+			tempFile, err := os.CreateTemp("", "resizer_stream_*.mp4")
+			if err != nil {
+				slog.Error("Failed to create temp file", "error", err)
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+			tempPath := tempFile.Name()
+			defer os.Remove(tempPath)
+
+			if _, err := io.Copy(tempFile, fullStream); err != nil {
+				tempFile.Close()
+				slog.Error("Failed to save stream to temp file", "error", err)
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+			tempFile.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+
+			if err := videop.ProcessVideo(ctx, tempPath, finalFilePath, opts); err != nil {
+				slog.Error("Chunked video processing failed", "error", err)
+				http.Error(w, "Video processing failed", http.StatusInternalServerError)
+				return
+			}
+		}
+	} else {
+		// Image processing using fullStream
+		img, err := imagep.DecodeImage(fileName, fullStream)
 		if err != nil {
-			slog.Error("Failed to encode webp", "error", err)
+			slog.Error("Failed to decode image", "error", err)
+			http.Error(w, "Failed to decode image", http.StatusBadRequest)
+			return
+		}
+
+		if width > 0 && height > 0 {
+			img = imagep.ResizedImage(img, width, height, cropX, cropY)
+		}
+		if radius > 0 {
+			img = imagep.RoundImage(img, radius)
+		}
+
+		if format == "webp" {
+			finalExt = "webp"
+		} else {
+			finalExt = "png"
+		}
+		finalFilePath = contentCacheBasePath + "." + finalExt
+
+		outputFile, err := service.Save(dir, finalFilePath)
+		if err != nil {
+			slog.Error("Failed to create image output file", "error", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
-	} else {
-		// Для PNG используем CompressionLevel исходя из качества:
-		// quality 100 -> BestSpeed (низкое сжатие, быстро),
-		// quality <= 80 -> BestCompression (макс сжатие файлов)
-		// Напрямую управлять потерями в PNG нельзя, но можно управлять скоростью.
-		pngEncoder := png.Encoder{CompressionLevel: png.DefaultCompression}
-		if quality >= 90 {
-			pngEncoder.CompressionLevel = png.BestSpeed
-		} else if quality <= 70 {
-			pngEncoder.CompressionLevel = png.BestCompression
-		}
 
-		err = pngEncoder.Encode(outputFile, img)
+		if format == "webp" {
+			options := webp.Options{Quality: quality}
+			err = webp.Encode(outputFile, img, options)
+		} else {
+			pngEncoder := png.Encoder{CompressionLevel: png.DefaultCompression}
+			if quality >= 90 {
+				pngEncoder.CompressionLevel = png.BestSpeed
+			} else if quality <= 70 {
+				pngEncoder.CompressionLevel = png.BestCompression
+			}
+			err = pngEncoder.Encode(outputFile, img)
+		}
 		outputFile.Close()
+
 		if err != nil {
-			slog.Error("Failed to encode png", "error", err)
+			slog.Error("Failed to encode image", "error", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 	}
+
+	processTime := time.Since(startProcess)
 
 	if updateData != "" {
 		service.CreateMeta(dir, updateData)
 	}
 
-	sendResponse()
+	w.Header().Set("X-Download-Time", downloadTime.String())
+	w.Header().Set("X-Processing-Time", processTime.String())
+	if hash := getFileHash(finalFilePath); hash != "" {
+		w.Header().Set("X-Image-Hash", hash)
+	}
+
+	if finalExt == "webp" {
+		w.Header().Set("Content-Type", "image/webp")
+	} else if finalExt == "png" {
+		w.Header().Set("Content-Type", "image/png")
+	} else if finalExt == "mp4" {
+		w.Header().Set("Content-Type", "video/mp4")
+	}
+
+	http.ServeFile(w, r, finalFilePath)
+}
+
+func HashCheckHandler(w http.ResponseWriter, r *http.Request) {
+	hash := r.URL.Query().Get("hash")
+	if hash == "" {
+		http.Error(w, "Parameter 'hash' is required", http.StatusBadRequest)
+		return
+	}
+
+	type match struct {
+		Path string `json:"path"`
+		Size int64  `json:"size"`
+	}
+	var matches []match
+
+	// Recursive search in StoragePath
+	err := filepath.Walk(StoragePath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // ignore errors, continue walking
+		}
+		if !info.IsDir() && strings.HasPrefix(info.Name(), hash) {
+			relPath, _ := filepath.Rel(StoragePath, path)
+			matches = append(matches, match{
+				Path: relPath,
+				Size: info.Size(),
+			})
+		}
+		return nil
+	})
+
+	if err != nil {
+		slog.Error("Failed to walk storage path", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	response := struct {
+		Exists  bool    `json:"exists"`
+		Hash    string  `json:"hash"`
+		Matches []match `json:"matches"`
+	}{
+		Exists:  len(matches) > 0,
+		Hash:    hash,
+		Matches: matches,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func URLInfoHandler(w http.ResponseWriter, r *http.Request) {
+	rawURL := r.URL.Query().Get("url")
+	if rawURL == "" {
+		http.Error(w, "Parameter 'url' is required", http.StatusBadRequest)
+		return
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		http.Error(w, "Invalid URL", http.StatusBadRequest)
+		return
+	}
+
+	// Logic to find the directory (same as ResizeHandler)
+	cleanPath := filepath.Clean(u.Path)
+	dir := filepath.Join(StoragePath, filepath.Dir(cleanPath))
+
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"exists": false,
+				"url":    rawURL,
+			})
+			return
+		}
+		slog.Error("Failed to read dir", "dir", dir, "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	var foundHash string
+	var fileList []string
+	for _, f := range files {
+		if f.IsDir() {
+			continue
+		}
+		name := f.Name()
+		// Avoid meta files or internal stuff
+		if strings.HasPrefix(name, ".") || name == "concat_list.txt" {
+			continue
+		}
+
+		// Extract hash (before first underscore)
+		parts := strings.Split(name, "_")
+		if len(parts) > 1 && len(parts[0]) == 64 { // SHA-256 hex length
+			foundHash = parts[0]
+		}
+		fileList = append(fileList, name)
+	}
+
+	response := struct {
+		Exists bool     `json:"exists"`
+		URL    string   `json:"url"`
+		Hash   string   `json:"hash,omitempty"`
+		Files  []string `json:"files,omitempty"`
+	}{
+		Exists: len(fileList) > 0,
+		URL:    rawURL,
+		Hash:   foundHash,
+		Files:  fileList,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 func ReadMeta(metaPath string) string {

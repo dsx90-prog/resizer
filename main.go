@@ -24,12 +24,16 @@ type Config struct {
 	Storage struct {
 		Path string `yaml:"path"`
 	} `yaml:"storage"`
+	Video struct {
+		ProcessingMode string `yaml:"processing_mode"`
+	} `yaml:"video"`
 }
 
 func loadConfig() *Config {
 	cfg := &Config{}
-	cfg.Server.Port = "8085"       // Default
-	cfg.Storage.Path = "artefacts" // Default
+	cfg.Server.Port = "8085"             // Default
+	cfg.Storage.Path = "artefacts"       // Default
+	cfg.Video.ProcessingMode = "chunked" // Default
 
 	// Load from file
 	f, err := os.Open("config.yml")
@@ -57,6 +61,10 @@ func loadConfig() *Config {
 		cfg.Storage.Path = envStoragePath
 	}
 
+	if envVideoMode := os.Getenv("VIDEO_PROCESSING_MODE"); envVideoMode != "" {
+		cfg.Video.ProcessingMode = envVideoMode
+	}
+
 	return cfg
 }
 
@@ -69,6 +77,7 @@ func main() {
 
 	handlers.AllowedDomains = cfg.Security.AllowedDomains
 	handlers.StoragePath = cfg.Storage.Path
+	handlers.VideoProcessingMode = cfg.Video.ProcessingMode
 
 	slog.Info("Starting resizer service", "port", cfg.Server.Port, "allowed_domains", handlers.AllowedDomains, "storage_path", handlers.StoragePath)
 
@@ -78,6 +87,8 @@ func main() {
 	}
 
 	http.HandleFunc("/", handlers.ResizeHandler)
+	http.HandleFunc("/check", handlers.HashCheckHandler)
+	http.HandleFunc("/info", handlers.URLInfoHandler)
 
 	// Запуск сервера в горутине
 	go func() {

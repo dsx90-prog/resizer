@@ -8,3 +8,6 @@ security:
 
 storage:
   path: artefacts
+
+video:
+  processing_mode: stream # Options: chunked, stream
