@@ -1,0 +1,10 @@
+server:
+  port: 8085
+
+security:
+#  allowed_domains:
+#    - google.com
+#    - yandex.ru
+
+storage:
+  path: artefacts

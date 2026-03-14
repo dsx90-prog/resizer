@@ -1,0 +1,48 @@
+# Тестовые запросы для микросервиса Resizer
+
+### 1. Ресайз изображения (первый запрос - скачивание и кеширование)
+# Примечание: домен get.wallhere.com должен быть в списке allowed_domains в config.yml
+GET http://localhost:8085/?width=300&height=300&url=https://get.wallhere.com/photo/lake-mountain-tree-water-landscape-1076231.jpg
+Accept: image/png
+
+###
+
+### 2. Запрос из кеша (повторный запрос)
+GET http://localhost:8085/?width=300&height=300&url=https://get.wallhere.com/photo/lake-mountain-tree-water-landscape-1076231.jpg
+Accept: image/png
+
+###
+
+### 3. Ресайз + Скругление
+GET http://localhost:8085/?width=300&height=300&radius=50&url=https://get.wallhere.com/photo/lake-mountain-tree-water-landscape-1076231.jpg
+Accept: image/png
+
+###
+
+### 4. Версионирование через timestamp (параметры в URL изображения)
+# Значение после ? в url изображения записывается в .meta и используется для проверки актуальности кеша
+GET http://localhost:8085/?width=200&height=300&url=https://s1.1zoom.ru/big7/974/Tropics_caribbean_311438.jpg?20240313
+Accept: image/png
+
+###
+
+### 5. Обрезка изображения (Center Crop - по умолчанию) с указанием якоря
+# Смещение по X: crop_x (left, center, right)
+# Смещение по Y: crop_y (top, center, bottom)
+# Например: обрезаем картинку по правому верхнему углу
+GET http://localhost:8085/?width=100&height=300&crop_x=right&crop_y=top&url=https://img.freepik.com/free-photo/beautiful-view-greenery-bridge-forest-perfect-background_181624-17827.jpg
+Accept: image/png
+
+###
+
+### 6. Конвертация в формат WebP с настраиваемым качеством
+# Использование параметра format=webp и q=50 (от 1 до 100) для получения сильно сжатого изображения (по умолчанию q=80)
+GET http://localhost:8085/?width=400&height=400&format=webp&q=50&url=https://s1.1zoom.ru/big7/974/Tropics_caribbean_311438.jpg
+Accept: image/webp
+
+###
+
+### 7. Ошибка: Домен не в белом списке
+# Если домен malicious.com не разрешен, вернется 403 Forbidden
+GET http://localhost:8085/?url=https://malicious.com/image.png
+Accept: image/png
