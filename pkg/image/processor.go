@@ -1,7 +1,6 @@
 package imagep
 
 import (
-	"fmt"
 	"image"
 	"image/color"
 	std_draw "image/draw"
@@ -11,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/HugoSmits86/nativewebp"
 	"golang.org/x/image/draw"
 )
 
@@ -167,12 +167,55 @@ func RoundImage(img image.Image, radius int) image.Image {
 }
 
 func DecodeImage(fileName string, file io.Reader) (img image.Image, err error) {
-	switch strings.ToLower(filepath.Ext(fileName)) {
+	ext := strings.ToLower(filepath.Ext(fileName))
+	switch ext {
 	case ".jpg", ".jpeg":
 		return jpeg.Decode(file)
 	case ".png":
 		return png.Decode(file)
-	default:
-		return nil, fmt.Errorf("unsupported file format")
+	case ".webp":
+		return nativewebp.Decode(file)
 	}
+
+	// Fallback to standard image.Decode which uses registered sniffers
+	img, _, err = image.Decode(file)
+	return img, err
+}
+
+func EncodeLosslessWebP(w io.Writer, img image.Image) error {
+	return nativewebp.Encode(w, img, nil)
+}
+
+// BlurImage applies a fast "frosted glass" blur effect by downscaling and upscaling the image.
+func BlurImage(img image.Image, strength int) image.Image {
+	if strength <= 0 {
+		return img
+	}
+
+	bounds := img.Bounds()
+	w, h := bounds.Dx(), bounds.Dy()
+
+	// Calculate downscale factor based on strength (1-100)
+	// At 100, we downscale to about 1/20th size.
+	factor := 1.0 + (float64(strength) / 5.0)
+
+	dtW := int(float64(w) / factor)
+	dtH := int(float64(h) / factor)
+
+	if dtW < 1 {
+		dtW = 1
+	}
+	if dtH < 1 {
+		dtH = 1
+	}
+
+	// Downscale
+	smallImg := image.NewRGBA(image.Rect(0, 0, dtW, dtH))
+	draw.BiLinear.Scale(smallImg, smallImg.Bounds(), img, bounds, draw.Over, nil)
+
+	// Upscale back
+	result := image.NewRGBA(bounds)
+	draw.BiLinear.Scale(result, result.Bounds(), smallImg, smallImg.Bounds(), draw.Over, nil)
+
+	return result
 }

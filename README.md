@@ -67,6 +67,7 @@ storage:
   nude_check:                # Детекция обнаженной натуры
     enabled: false           # Включить глобально
     fail_on_nude: true       # Ошибка 403 при обнаружении
+    blur_on_nude: false      # Эффект "мутного стекла" вместо блокировки
 video:
   processing_mode: stream   # Режимы: stream, chunked
 transformations:
@@ -82,13 +83,15 @@ transformations:
 `GET /?url={URL}&width={W}&height={H}&format={F}&q={Q}&start={S}&end={E}&preset={P}&s={SIG}`
 
 | `s` | HMAC-SHA256 подпись параметров | Hex строка |
+| `nude_check` | Включить проверку на nudity | `1` или `true` |
+| `nude_blur` | Включить эффект "мутного стекла" | `1` или `true` (автоматически включает `nude_check`) |
 
 **Ответ:**
 *   **Успех**: Бинарные данные (изображение или видео).
 *   **Заголовки**:
     *   `Content-Type`: `image/webp`, `image/png` или `video/mp4`.
     *   `X-Cache`: `HIT` (из кеша), `HIT-ID` (по контенту), `MISS` (новая обработка).
-    *   `X-Nude`: `true` (если обнаружена обнаженная натура).
+    *   `X-Nude`: `true` (если обнаружена), `blurred` (если применен эффект блюра).
 
 ### 2. Подтверждение черновика (`/confirm`)
 Переносит файл из локальной папки черновиков в основное хранилище (S3).

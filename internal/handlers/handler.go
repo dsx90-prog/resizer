@@ -47,6 +47,7 @@ var DraftPath string = "temp_drafts"
 
 var NudeCheckEnabled bool = false
 var FailOnNude bool = true
+var NudeBlurEnabled bool = false
 
 type PresetConfig struct {
 	Width   int
@@ -163,7 +164,9 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	nudeCheckReq := r.URL.Query().Get("nude_check") == "1" || r.URL.Query().Get("nude_check") == "true"
-	doNudeCheck := NudeCheckEnabled || nudeCheckReq
+	nudeBlurReq := r.URL.Query().Get("nude_blur") == "1" || r.URL.Query().Get("nude_blur") == "true"
+	doNudeBlur := NudeBlurEnabled || nudeBlurReq
+	doNudeCheck := NudeCheckEnabled || nudeCheckReq || doNudeBlur
 
 	// 0. Verify signature if enabled
 	if SignatureEnabled {
@@ -591,12 +594,16 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 					slog.Warn("Nudity check failed", "error", err)
 				} else if isNude {
 					w.Header().Set("X-Nude", "true")
-					if FailOnNude {
+					if doNudeBlur {
+						w.Header().Set("X-Nude", "blurred")
+						slog.Info("Nudity detected, applying blur")
+					} else if FailOnNude {
 						slog.Info("Nudity detected, blocking request")
 						http.Error(w, "Forbidden: Nudity detected", http.StatusForbidden)
 						return
+					} else {
+						slog.Info("Nudity detected, allowing but marking")
 					}
-					slog.Info("Nudity detected, allowing but marking")
 				}
 
 				// Now decode from the temp file since stream is consumed
@@ -622,6 +629,11 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 			img = imagep.RoundImage(img, radius)
 		}
 
+		// Apply nudity blur if detected and requested
+		if w.Header().Get("X-Nude") == "blurred" {
+			img = imagep.BlurImage(img, 50) // Default blur strength
+		}
+
 		imgExt := format
 		if imgExt == "" {
 			imgExt = "png"
@@ -631,8 +643,12 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 		// Encode to buffer or temp file
 		buf := new(bytes.Buffer)
 		if format == "webp" {
-			options := webp.Options{Quality: quality}
-			err = webp.Encode(buf, img, options)
+			if quality == 100 {
+				err = imagep.EncodeLosslessWebP(buf, img)
+			} else {
+				options := webp.Options{Quality: quality}
+				err = webp.Encode(buf, img, options)
+			}
 		} else {
 			pngEncoder := png.Encoder{CompressionLevel: png.DefaultCompression}
 			if quality >= 90 {
@@ -654,7 +670,7 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 		hashesData, _ := json.Marshal(hashes)
 
 		// Save to store / Draft
-		if err := saveToStore(r.Context(), actualKey, buf, expiration); err != nil {
+		if err := saveToStore(r.Context(), actualKey, bytes.NewReader(buf.Bytes()), expiration); err != nil {
 			slog.Error("Failed to save image to store", "error", err)
 		}
 

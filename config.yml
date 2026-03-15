@@ -12,6 +12,7 @@ security:
   nude_check:
     enabled: false
     fail_on_nude: true
+    blur_on_nude: false
 
 storage:
   type: local # local или s3

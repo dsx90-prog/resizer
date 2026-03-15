@@ -30,6 +30,7 @@ type Config struct {
 		NudeCheck struct {
 			Enabled    bool `yaml:"enabled"`
 			FailOnNude bool `yaml:"fail_on_nude"`
+			NudeBlur   bool `yaml:"blur_on_nude"`
 		} `yaml:"nude_check"`
 	} `yaml:"security"`
 	Storage struct {
@@ -120,6 +121,7 @@ func main() {
 	handlers.StoragePath = cfg.Storage.Path
 	handlers.NudeCheckEnabled = cfg.Security.NudeCheck.Enabled
 	handlers.FailOnNude = cfg.Security.NudeCheck.FailOnNude
+	handlers.NudeBlurEnabled = cfg.Security.NudeCheck.NudeBlur
 
 	// Initialize Storage Provider
 	ctx := context.Background()
