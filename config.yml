@@ -2,6 +2,10 @@ server:
   port: 8085
 
 security:
+  signature:
+    enabled: false # Включите для защиты параметров URL
+    allow_sign: true # Разрешить ли эндпоинт /sign для генерации подписи
+    key: "super-secret-key-change-me"
 #  allowed_domains:
 #    - google.com
 #    - yandex.ru
@@ -11,3 +15,18 @@ storage:
 
 video:
   processing_mode: stream # Options: chunked, stream
+
+transformations:
+  allow_custom: true
+  presets:
+    avatar:
+      width: 100
+      height: 100
+      radius: 50
+    thumbnail:
+      width: 300
+      height: 300
+    cover:
+      width: 1280
+      height: 720
+      quality: 90

@@ -20,6 +20,11 @@ type Config struct {
 	} `yaml:"server"`
 	Security struct {
 		AllowedDomains []string `yaml:"allowed_domains"`
+		Signature      struct {
+			Enabled   bool   `yaml:"enabled"`
+			AllowSign bool   `yaml:"allow_sign"`
+			Key       string `yaml:"key"`
+		} `yaml:"signature"`
 	} `yaml:"security"`
 	Storage struct {
 		Path string `yaml:"path"`
@@ -27,6 +32,15 @@ type Config struct {
 	Video struct {
 		ProcessingMode string `yaml:"processing_mode"`
 	} `yaml:"video"`
+	Transformations struct {
+		AllowCustom bool `yaml:"allow_custom"`
+		Presets     map[string]struct {
+			Width   int `yaml:"width"`
+			Height  int `yaml:"height"`
+			Radius  int `yaml:"radius"`
+			Quality int `yaml:"quality"`
+		} `yaml:"presets"`
+	} `yaml:"transformations"`
 }
 
 func loadConfig() *Config {
@@ -76,8 +90,21 @@ func main() {
 	slog.SetDefault(logger)
 
 	handlers.AllowedDomains = cfg.Security.AllowedDomains
+	handlers.SignatureEnabled = cfg.Security.Signature.Enabled
+	handlers.AllowSignatureGen = cfg.Security.Signature.AllowSign
+	handlers.SecurityKey = cfg.Security.Signature.Key
 	handlers.StoragePath = cfg.Storage.Path
 	handlers.VideoProcessingMode = cfg.Video.ProcessingMode
+	handlers.AllowCustomDimensions = cfg.Transformations.AllowCustom
+	handlers.Presets = make(map[string]handlers.PresetConfig)
+	for name, p := range cfg.Transformations.Presets {
+		handlers.Presets[name] = handlers.PresetConfig{
+			Width:   p.Width,
+			Height:  p.Height,
+			Radius:  p.Radius,
+			Quality: p.Quality,
+		}
+	}
 
 	slog.Info("Starting resizer service", "port", cfg.Server.Port, "allowed_domains", handlers.AllowedDomains, "storage_path", handlers.StoragePath)
 
@@ -89,6 +116,7 @@ func main() {
 	http.HandleFunc("/", handlers.ResizeHandler)
 	http.HandleFunc("/check", handlers.HashCheckHandler)
 	http.HandleFunc("/info", handlers.URLInfoHandler)
+	http.HandleFunc("/sign", handlers.SignatureGenHandler)
 
 	// Запуск сервера в горутине
 	go func() {

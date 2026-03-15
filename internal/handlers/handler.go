@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"resizer/internal/service"
 	imagep "resizer/pkg/image"
 	videop "resizer/pkg/video"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +30,18 @@ import (
 var AllowedDomains []string
 var StoragePath string = "artefacts"       // Default value
 var VideoProcessingMode string = "chunked" // Default value
+var SignatureEnabled bool = false
+var AllowSignatureGen bool = true
+var SecurityKey string = ""
+var AllowCustomDimensions bool = true
+var Presets map[string]PresetConfig
+
+type PresetConfig struct {
+	Width   int
+	Height  int
+	Radius  int
+	Quality int
+}
 
 func getFileHash(filePath string) string {
 	data, err := os.ReadFile(filePath)
@@ -38,9 +52,54 @@ func getFileHash(filePath string) string {
 	return hex.EncodeToString(hash[:])
 }
 
+func verifySignature(params url.Values, key string) bool {
+	receivedSig := params.Get("s")
+	if receivedSig == "" {
+		return false
+	}
+
+	expectedSig := calculateSignature(params, key)
+	return hmac.Equal([]byte(receivedSig), []byte(expectedSig))
+}
+
+func calculateSignature(params url.Values, key string) string {
+	// Create a sorted list of keys to ensure consistent signature
+	keys := make([]string, 0, len(params))
+	for k := range params {
+		if k != "s" {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteString("&")
+		}
+		b.WriteString(k)
+		b.WriteString("=")
+		b.WriteString(params.Get(k))
+	}
+
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write([]byte(b.String()))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 	// Получить параметры из URL
 	params := r.URL.Query()
+
+	// 0. Verify signature if enabled
+	if SignatureEnabled {
+		if !verifySignature(params, SecurityKey) {
+			slog.Warn("Invalid or missing URL signature")
+			http.Error(w, "Invalid or missing URL signature ('s' parameter)", http.StatusForbidden)
+			return
+		}
+	}
+
 	rawImageURL := params.Get("url")
 	if rawImageURL == "" {
 		http.Error(w, "Parameter 'url' is required", http.StatusBadRequest)
@@ -78,6 +137,30 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 
 	startSec, _ := strconv.ParseFloat(params.Get("start"), 64)
 	endSec, _ := strconv.ParseFloat(params.Get("end"), 64)
+
+	presetName := params.Get("preset")
+	if presetName != "" {
+		if p, ok := Presets[presetName]; ok {
+			slog.Info("Applying preset", "name", presetName)
+			width = p.Width
+			height = p.Height
+			if p.Radius > 0 {
+				radius = p.Radius
+			}
+			if p.Quality > 0 {
+				quality = p.Quality
+			}
+		} else {
+			slog.Warn("Preset not found", "name", presetName)
+		}
+	}
+
+	// If custom dimensions are disabled, check if we are using a preset or just downloading original
+	if !AllowCustomDimensions && presetName == "" && (params.Get("width") != "" || params.Get("height") != "" || params.Get("radius") != "") {
+		slog.Warn("Custom dimensions are disabled and no preset provided")
+		http.Error(w, "Custom dimensions are disabled. Please use a valid 'preset'.", http.StatusForbidden)
+		return
+	}
 
 	// Разобрать URL
 	u, err := url.Parse(rawImageURL)
@@ -494,6 +577,41 @@ func URLInfoHandler(w http.ResponseWriter, r *http.Request) {
 		URL:    rawURL,
 		Hash:   foundHash,
 		Files:  fileList,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func SignatureGenHandler(w http.ResponseWriter, r *http.Request) {
+	if !AllowSignatureGen {
+		slog.Warn("Signature generation is disabled by config")
+		http.Error(w, "Signature generation is disabled", http.StatusForbidden)
+		return
+	}
+	if SecurityKey == "" {
+		http.Error(w, "Security key is not configured", http.StatusInternalServerError)
+		return
+	}
+
+	params := r.URL.Query()
+	if params.Get("url") == "" {
+		http.Error(w, "Parameter 'url' is required to generate signature", http.StatusBadRequest)
+		return
+	}
+
+	sig := calculateSignature(params, SecurityKey)
+
+	// Build the signed path
+	params.Set("s", sig)
+	signedQuery := params.Encode()
+
+	response := struct {
+		Signature string `json:"signature"`
+		SignedURL string `json:"signed_url"`
+	}{
+		Signature: sig,
+		SignedURL: "/?" + signedQuery,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
