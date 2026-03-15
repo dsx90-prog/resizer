@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image"
 	"image/png"
 	"io"
 	"log/slog"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	"github.com/gen2brain/webp"
+	"github.com/koyachi/go-nude"
 )
 
 var AllowedDomains []string
@@ -41,6 +43,9 @@ var GlobalStore storage.StorageProvider
 var DraftEnabled bool = false
 var DraftTTL time.Duration = time.Hour
 var DraftPath string = "temp_drafts"
+
+var NudeCheckEnabled bool = false
+var FailOnNude bool = true
 
 type PresetConfig struct {
 	Width   int
@@ -137,6 +142,9 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
+	nudeCheckReq := r.URL.Query().Get("nude_check") == "1" || r.URL.Query().Get("nude_check") == "true"
+	doNudeCheck := NudeCheckEnabled || nudeCheckReq
 
 	// 0. Verify signature if enabled
 	if SignatureEnabled {
@@ -540,8 +548,48 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		// Image processing using fullStream
-		img, err := imagep.DecodeImage(fileName, fullStream)
+		// Image processing
+		var img image.Image
+		var err error
+
+		if doNudeCheck {
+			// go-nude needs a file path
+			tempFile, err := os.CreateTemp("", "resizer_nude_*.tmp")
+			if err != nil {
+				slog.Error("Failed to create temp file for nude check", "error", err)
+			} else {
+				tempPath := tempFile.Name()
+				defer os.Remove(tempPath)
+
+				if _, err := io.Copy(tempFile, fullStream); err != nil {
+					slog.Error("Failed to save stream to temp for nude check", "error", err)
+				}
+				tempFile.Close()
+
+				// Perform check
+				isNude, err := nude.IsNude(tempPath)
+				if err != nil {
+					slog.Warn("Nudity check failed", "error", err)
+				} else if isNude {
+					w.Header().Set("X-Nude", "true")
+					if FailOnNude {
+						slog.Info("Nudity detected, blocking request")
+						http.Error(w, "Forbidden: Nudity detected", http.StatusForbidden)
+						return
+					}
+					slog.Info("Nudity detected, allowing but marking")
+				}
+
+				// Now decode from the temp file since stream is consumed
+				f, _ := os.Open(tempPath)
+				defer f.Close()
+				img, err = imagep.DecodeImage(fileName, f)
+			}
+		} else {
+			// Normal decoding from stream
+			img, err = imagep.DecodeImage(fileName, fullStream)
+		}
+
 		if err != nil {
 			slog.Error("Failed to decode image", "error", err)
 			http.Error(w, "Failed to decode image", http.StatusBadRequest)

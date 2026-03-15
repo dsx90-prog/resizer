@@ -64,6 +64,9 @@ storage:
   download:
     user_agent: "Mozilla/5.0..." # Кастомный User-Agent для скачивания
     forward_headers: false   # Пробрасывать ли заголовки клиента
+  nude_check:                # Детекция обнаженной натуры
+    enabled: false           # Включить глобально
+    fail_on_nude: true       # Ошибка 403 при обнаружении
 video:
   processing_mode: stream   # Режимы: stream, chunked
 transformations:
@@ -86,6 +89,7 @@ transformations:
 | `start`, `end` | (Видео) фрагмент для обрезки | Секунды (float) |
 | `format` | Выходной формат | `png`, `webp` (картинки), `mp4` |
 | `q` | Качество сжатия (1-100) | 80 (по умолчанию) |
+| `nude_check` | Включить проверку на nude | `1` или `true` |
 | `draft_ttl` | Включить режим черновика и указать время | `1h`, `2026-03-20` |
 | `s` | HMAC-SHA256 подпись параметров | Hex строка |
 

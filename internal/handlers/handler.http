@@ -73,3 +73,10 @@ Content-Type: application/json
 # Подтверждает ВСЕ варианты обработки для данного Content ID
 POST http://localhost:8085/confirm?hash=e3b0c442
 Content-Type: application/json
+
+###
+
+### 12. Детекция обнаженной натуры (Nudity Detection)
+# Включаем проверку через nude_check=1. В случае обнаружения вернется 403 (если fail_on_nude: true)
+GET http://localhost:8085/?url=https://get.wallhere.com/photo/lake-mountain-tree-water-landscape-1076231.jpg&width=200&height=200&nude_check=1
+Accept: image/png

@@ -9,6 +9,9 @@ security:
 #  allowed_domains:
 #    - google.com
 #    - yandex.ru
+  nude_check:
+    enabled: false
+    fail_on_nude: true
 
 storage:
   type: local # local или s3

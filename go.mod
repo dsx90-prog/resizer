@@ -8,6 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.12
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.97.1
 	github.com/gen2brain/webp v0.5.5
+	github.com/koyachi/go-nude v0.0.1
 	golang.org/x/image v0.37.0
 	gopkg.in/yaml.v3 v3.0.1
 )

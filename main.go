@@ -27,6 +27,10 @@ type Config struct {
 			AllowSign bool   `yaml:"allow_sign"`
 			Key       string `yaml:"key"`
 		} `yaml:"signature"`
+		NudeCheck struct {
+			Enabled    bool `yaml:"enabled"`
+			FailOnNude bool `yaml:"fail_on_nude"`
+		} `yaml:"nude_check"`
 	} `yaml:"security"`
 	Storage struct {
 		Type string `yaml:"type"`
@@ -114,6 +118,8 @@ func main() {
 	handlers.AllowSignatureGen = cfg.Security.Signature.AllowSign
 	handlers.SecurityKey = cfg.Security.Signature.Key
 	handlers.StoragePath = cfg.Storage.Path
+	handlers.NudeCheckEnabled = cfg.Security.NudeCheck.Enabled
+	handlers.FailOnNude = cfg.Security.NudeCheck.FailOnNude
 
 	// Initialize Storage Provider
 	ctx := context.Background()
