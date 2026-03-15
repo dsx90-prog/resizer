@@ -15,6 +15,8 @@ type StorageProvider interface {
 	GetReader(ctx context.Context, path string) (io.ReadCloser, error)
 	Delete(ctx context.Context, path string) error
 	List(ctx context.Context, prefix string) ([]string, error)
+	// Returns the type of storage ("local" or "s3")
+	Type() string
 	// For local-specific operations like FFmpeg processing which needs local paths
 	// We might need a way to ensure a file is local
 	LocalPath(path string) (string, bool)
@@ -85,4 +87,8 @@ func (l *LocalStorage) List(ctx context.Context, prefix string) ([]string, error
 
 func (l *LocalStorage) LocalPath(path string) (string, bool) {
 	return filepath.Join(l.BasePath, path), true
+}
+
+func (l *LocalStorage) Type() string {
+	return "local"
 }

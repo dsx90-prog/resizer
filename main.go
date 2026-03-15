@@ -28,9 +28,11 @@ type Config struct {
 			Key       string `yaml:"key"`
 		} `yaml:"signature"`
 		NudeCheck struct {
-			Enabled    bool `yaml:"enabled"`
-			FailOnNude bool `yaml:"fail_on_nude"`
-			NudeBlur   bool `yaml:"blur_on_nude"`
+			Enabled          bool    `yaml:"enabled"`
+			FailOnNude       bool    `yaml:"fail_on_nude"`
+			NudeBlur         bool    `yaml:"blur_on_nude"`
+			NudeBlurStrength int     `yaml:"blur_strength"`
+			SkinThreshold    float64 `yaml:"skin_threshold"`
 		} `yaml:"nude_check"`
 	} `yaml:"security"`
 	Storage struct {
@@ -122,6 +124,10 @@ func main() {
 	handlers.NudeCheckEnabled = cfg.Security.NudeCheck.Enabled
 	handlers.FailOnNude = cfg.Security.NudeCheck.FailOnNude
 	handlers.NudeBlurEnabled = cfg.Security.NudeCheck.NudeBlur
+	handlers.NudeBlurStrength = cfg.Security.NudeCheck.NudeBlurStrength
+	if cfg.Security.NudeCheck.SkinThreshold > 0 {
+		handlers.NudeSkinThreshold = cfg.Security.NudeCheck.SkinThreshold
+	}
 
 	// Initialize Storage Provider
 	ctx := context.Background()
@@ -190,7 +196,8 @@ func main() {
 		Handler: nil, // DefaultServeMux (will use http.HandleFunc mappings)
 	}
 
-	http.HandleFunc("/", handlers.ResizeHandler)
+	http.HandleFunc("GET /{$}", handlers.ResizeHandler)
+	http.HandleFunc("POST /upload", handlers.UploadHandler)
 	http.HandleFunc("/check", handlers.HashCheckHandler)
 	http.HandleFunc("/info", handlers.URLInfoHandler)
 	http.HandleFunc("/sign", handlers.SignatureGenHandler)

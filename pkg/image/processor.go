@@ -19,6 +19,16 @@ func ResizedImage(img image.Image, width, height int, cropX, cropY string) image
 	srcWidth := srcBounds.Dx()
 	srcHeight := srcBounds.Dy()
 
+	if width <= 0 && height <= 0 {
+		return img
+	}
+
+	if width <= 0 {
+		width = int(float64(height) * float64(srcWidth) / float64(srcHeight))
+	} else if height <= 0 {
+		height = int(float64(width) * float64(srcHeight) / float64(srcWidth))
+	}
+
 	// Вычисляем коэффициенты масштабирования для обеих осей
 	scaleX := float64(width) / float64(srcWidth)
 	scaleY := float64(height) / float64(srcHeight)
@@ -186,7 +196,40 @@ func EncodeLosslessWebP(w io.Writer, img image.Image) error {
 	return nativewebp.Encode(w, img, nil)
 }
 
-// BlurImage applies a fast "frosted glass" blur effect by downscaling and upscaling the image.
+// averageColor вычисляет средний цвет изображения путём сэмплинга пикселей.
+func averageColor(img image.Image) color.RGBA {
+	bounds := img.Bounds()
+	w, h := bounds.Dx(), bounds.Dy()
+
+	// Сэмплируем не более 64x64 пикселей для скорости
+	stepX := max(1, w/64)
+	stepY := max(1, h/64)
+
+	var rSum, gSum, bSum, aSum, count uint64
+	for y := bounds.Min.Y; y < bounds.Max.Y; y += stepY {
+		for x := bounds.Min.X; x < bounds.Max.X; x += stepX {
+			r, g, b, a := img.At(x, y).RGBA()
+			rSum += uint64(r >> 8)
+			gSum += uint64(g >> 8)
+			bSum += uint64(b >> 8)
+			aSum += uint64(a >> 8)
+			count++
+		}
+	}
+	if count == 0 {
+		return color.RGBA{0, 0, 0, 255}
+	}
+	return color.RGBA{
+		R: uint8(rSum / count),
+		G: uint8(gSum / count),
+		B: uint8(bSum / count),
+		A: uint8(aSum / count),
+	}
+}
+
+// BlurImage применяет эффект «матового стекла»:
+//   - strength 1–99: многопроходное двухлинейное размытие (мягкое, без пикселизации)
+//   - strength 100: замена изображения средним цветом (полная абстракция)
 func BlurImage(img image.Image, strength int) image.Image {
 	if strength <= 0 {
 		return img
@@ -195,27 +238,46 @@ func BlurImage(img image.Image, strength int) image.Image {
 	bounds := img.Bounds()
 	w, h := bounds.Dx(), bounds.Dy()
 
-	// Calculate downscale factor based on strength (1-100)
-	// At 100, we downscale to about 1/20th size.
+	// При 100% — заливка средним цветом
+	if strength >= 100 {
+		avg := averageColor(img)
+		result := image.NewRGBA(bounds)
+		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+			for x := bounds.Min.X; x < bounds.Max.X; x++ {
+				result.SetRGBA(x, y, avg)
+			}
+		}
+		return result
+	}
+
+	// Количество проходов: от 1 при strength=1 до 6 при strength=99
+	passes := 1 + (strength * 5 / 99)
+
+	// Степень сжатия: при strength=1 почти нет сжатия, при strength=99 — сильное
+	// factor: от 1.05 до 20
 	factor := 1.0 + (float64(strength) / 5.0)
 
-	dtW := int(float64(w) / factor)
-	dtH := int(float64(h) / factor)
+	current := img
+	for i := 0; i < passes; i++ {
+		dtW := int(float64(w) / factor)
+		dtH := int(float64(h) / factor)
+		if dtW < 1 {
+			dtW = 1
+		}
+		if dtH < 1 {
+			dtH = 1
+		}
 
-	if dtW < 1 {
-		dtW = 1
+		// Downscale
+		small := image.NewRGBA(image.Rect(0, 0, dtW, dtH))
+		draw.BiLinear.Scale(small, small.Bounds(), current, current.Bounds(), draw.Over, nil)
+
+		// Upscale back to original size using CatmullRom for smoothness
+		up := image.NewRGBA(bounds)
+		draw.CatmullRom.Scale(up, up.Bounds(), small, small.Bounds(), draw.Over, nil)
+
+		current = up
 	}
-	if dtH < 1 {
-		dtH = 1
-	}
 
-	// Downscale
-	smallImg := image.NewRGBA(image.Rect(0, 0, dtW, dtH))
-	draw.BiLinear.Scale(smallImg, smallImg.Bounds(), img, bounds, draw.Over, nil)
-
-	// Upscale back
-	result := image.NewRGBA(bounds)
-	draw.BiLinear.Scale(result, result.Bounds(), smallImg, smallImg.Bounds(), draw.Over, nil)
-
-	return result
+	return current
 }

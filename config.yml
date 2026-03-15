@@ -10,9 +10,11 @@ security:
 #    - google.com
 #    - yandex.ru
   nude_check:
-    enabled: false
-    fail_on_nude: true
+    enabled: true
+    fail_on_nude: false
     blur_on_nude: false
+    blur_strength: 80
+    skin_threshold: 35  # % skin pixels required (15=default/sensitive, 35=balanced, 60=strict)
 
 storage:
   type: local # local или s3

@@ -116,3 +116,7 @@ func (s *S3Storage) LocalPath(path string) (string, bool) {
 	// S3 doesn't have a local path. FFmpeg might need to download it first.
 	return "", false
 }
+
+func (s *S3Storage) Type() string {
+	return "s3"
+}

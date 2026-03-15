@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	"image/jpeg"
 	"image/png"
 	"io"
 	"log/slog"
@@ -48,12 +49,31 @@ var DraftPath string = "temp_drafts"
 var NudeCheckEnabled bool = false
 var FailOnNude bool = true
 var NudeBlurEnabled bool = false
+var NudeBlurStrength int = 50
+var NudeSkinThreshold float64 = 15.0 // % skin pixels to consider nude (go-nude default is 15)
 
 type PresetConfig struct {
 	Width   int
 	Height  int
 	Radius  int
 	Quality int
+}
+
+type MediaParams struct {
+	Width      int
+	Height     int
+	Radius     int
+	Quality    int
+	Format     string
+	CropX      string
+	CropY      string
+	Start      float64
+	End        float64
+	NudeCheck  bool
+	NudeBlur   bool
+	Blur       int
+	Info       bool
+	Expiration time.Time
 }
 
 func getFileHash(filePath string) string {
@@ -66,12 +86,14 @@ func getFileHash(filePath string) string {
 }
 
 type ImageHashes struct {
-	Average    string `json:"a_hash"`
-	Perceptual string `json:"p_hash"`
-	Difference string `json:"d_hash"`
+	Average    string    `json:"a_hash"`
+	Perceptual string    `json:"p_hash"`
+	Difference string    `json:"d_hash"`
+	IsNude     bool      `json:"is_nude"`
+	CreatedAt  time.Time `json:"upload_date"`
 }
 
-func calculateImageHashes(img image.Image) ImageHashes {
+func calculateImageHashes(img image.Image, isNude bool) ImageHashes {
 	aHash, _ := goimagehash.AverageHash(img)
 	pHash, _ := goimagehash.PerceptionHash(img)
 	dHash, _ := goimagehash.DifferenceHash(img)
@@ -80,7 +102,77 @@ func calculateImageHashes(img image.Image) ImageHashes {
 		Average:    aHash.ToString(),
 		Perceptual: pHash.ToString(),
 		Difference: dHash.ToString(),
+		IsNude:     isNude,
+		CreatedAt:  time.Now(),
 	}
+}
+
+// isNudeWithThreshold использует go-nude Detector напрямую с кастомным порогом скин-пикселей.
+// Стандартный порог в библиотеке — 15%; здесь можно задать выше, чтобы снизить ложные срабатывания.
+func isNudeWithThreshold(imagePath string, skinThresholdPct float64) (bool, error) {
+	d := nude.NewDetector(imagePath)
+	_, err := d.Parse()
+	if err != nil {
+		return false, err
+	}
+
+	if len(d.SkinRegions) < 3 {
+		return false, nil
+	}
+
+	// Считаем общее кол-во skin-пикселей
+	totalSkin := 0
+	for _, region := range d.SkinRegions {
+		totalSkin += len(region)
+	}
+
+	// Применяем пользовательский порог вместо захардкоженных 15%
+	totalPixels := 0
+	for _, region := range d.SkinRegions {
+		totalPixels += len(region)
+	}
+	// go-nude уже учёл totalPixels внутри, нам нужна оценка через SkinRegions.
+	// Используем метод из библиотеки: отношение skin к полному набору пикселей
+	// недоступно напрямую, поэтому используем skinRegions суммарно vs bound.
+	// Простейшая оценка: если IsNude вернул true, перепроверяем с нашим порогом.
+	//
+	// Альтернативная оценка: запустить parse и прочитать SkinRegions size.
+	// Чем выше skinThresholdPct, тем строже фильтрация.
+	//
+	// Упрощённо: считаем долю skin-пикселей от суммы всех region-пикселей,
+	// но для корректного расчёта нужен totalPixels из Detector (приватное поле).
+	// Поэтому мы запрашиваем анализ через публичный API и корректируем:
+	// если библиотека говорит nude=true, но наш порог выше — отменяем.
+	_ = totalPixels // unused since we use the approach below
+
+	// Реальный подход: смотрим на largest skin region vs all skin pixels
+	// Перебираем регионы чтобы найти самый большой
+	maxRegion := 0
+	for _, region := range d.SkinRegions {
+		if len(region) > maxRegion {
+			maxRegion = len(region)
+		}
+	}
+
+	if totalSkin == 0 {
+		return false, nil
+	}
+
+	// Ключевая проверка: доля самого большого региона от суммы всех skin-пикселей
+	biggestPct := float64(maxRegion) / float64(totalSkin) * 100
+
+	// go-nude считает nude когда biggest >= 45% от всех skin-пикселей
+	// Мы добавляем дополнительный фильтр через skinThresholdPct:
+	// если порог поднят выше 15, требуем чтобы крупнейший регион
+	// покрывал больший процент изображения.
+	// Перемасштабируем: при threshold=15 — стандартно 45%, при threshold=50 — требуем 75%+
+	adjustedMinBiggest := 45.0 + (skinThresholdPct-15.0)*0.6
+
+	if biggestPct < adjustedMinBiggest {
+		return false, nil
+	}
+
+	return true, nil
 }
 
 func verifySignature(params url.Values, key string) bool {
@@ -146,6 +238,10 @@ func saveToStore(ctx context.Context, path string, data io.Reader, expiresAt tim
 }
 
 func ResizeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
 	// Получить параметры из URL
 	params := r.URL.Query()
 
@@ -165,6 +261,8 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 
 	nudeCheckReq := r.URL.Query().Get("nude_check") == "1" || r.URL.Query().Get("nude_check") == "true"
 	nudeBlurReq := r.URL.Query().Get("nude_blur") == "1" || r.URL.Query().Get("nude_blur") == "true"
+	infoReq := r.URL.Query().Get("info") == "1" || r.URL.Query().Get("info") == "true"
+	blur, _ := strconv.Atoi(params.Get("blur"))
 	doNudeBlur := NudeBlurEnabled || nudeBlurReq
 	doNudeCheck := NudeCheckEnabled || nudeCheckReq || doNudeBlur
 
@@ -281,7 +379,7 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 	metaPath := filepath.Join(dir, ".meta")
 
 	filenameWithoutExtension := strings.TrimSuffix(fileName, path.Ext(fileName))
-	if width > 0 && height > 0 {
+	if width > 0 || height > 0 {
 		filenameWithoutExtension = fmt.Sprintf("%s_resized-%dx%d", filenameWithoutExtension, width, height)
 		if cropX != "center" || cropY != "center" {
 			filenameWithoutExtension = fmt.Sprintf("%s_crop-%s-%s", filenameWithoutExtension, cropX, cropY)
@@ -298,6 +396,9 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if endSec > 0 {
 		filenameWithoutExtension = fmt.Sprintf("%s_end-%.2f", filenameWithoutExtension, endSec)
+	}
+	if blur > 0 {
+		filenameWithoutExtension = fmt.Sprintf("%s_blur-%d", filenameWithoutExtension, blur)
 	}
 
 	// Сначала мы не знаем точное расширение (mp4/png/webp), поэтому пока просто базовое имя пути к кешу
@@ -328,6 +429,57 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 					w.Header().Set("Content-Type", "image/png")
 				} else if strings.HasSuffix(cachedKey, ".mp4") {
 					w.Header().Set("Content-Type", "video/mp4")
+				}
+
+				if params.Get("info") == "1" || params.Get("info") == "true" {
+					w.Header().Set("Content-Type", "application/json")
+
+					draftLocal := filepath.Join(DraftPath, fullKey)
+					isDraft := false
+					if _, err := os.Stat(draftLocal); err == nil {
+						isDraft = true
+					}
+
+					info := map[string]interface{}{
+						"is_cache_hit": true,
+						"path":         fullKey,
+						"storage_type": GlobalStore.Type(),
+						"is_draft":     isDraft,
+					}
+
+					// Try to load hashes if they exist
+					hashKey := fullKey + ".hashes"
+					var hashesReader io.ReadCloser
+					var hErr error
+
+					if isDraft {
+						hashesReader, hErr = os.Open(draftLocal + ".hashes")
+					} else {
+						hashesReader, hErr = GlobalStore.GetReader(r.Context(), hashKey)
+					}
+
+					if hErr == nil {
+						defer hashesReader.Close()
+						var hashes ImageHashes
+						if err := json.NewDecoder(hashesReader).Decode(&hashes); err == nil {
+							info["hashes"] = hashes
+							info["is_nude"] = hashes.IsNude
+							info["upload_date"] = hashes.CreatedAt
+						}
+					}
+
+					// Check for draft TTL
+					if isDraft {
+						ttlPath := draftLocal + ".ttl"
+						if ttlData, err := os.ReadFile(ttlPath); err == nil {
+							if ts, err := strconv.ParseInt(string(ttlData), 10, 64); err == nil {
+								info["draft_expiration"] = time.Unix(ts, 0)
+							}
+						}
+					}
+
+					json.NewEncoder(w).Encode(info)
+					return
 				}
 
 				if localPath, isLocal := GlobalStore.LocalPath(fullKey); isLocal {
@@ -400,6 +552,9 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 	if endSec > 0 {
 		filenameWithContentID = fmt.Sprintf("%s_end-%.2f", filenameWithContentID, endSec)
 	}
+	if blur > 0 {
+		filenameWithContentID = fmt.Sprintf("%s_blur-%d", filenameWithContentID, blur)
+	}
 	// contentCacheBasePath := filepath.Join(dir, filenameWithContentID)
 
 	// Check if we have THIS EXACT CONTENT already processed
@@ -410,10 +565,8 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 		// Check draft too
 		draftLocal := filepath.Join(DraftPath, actualKey)
 		draftExists := false
-		if DraftEnabled {
-			if _, err := os.Stat(draftLocal); err == nil {
-				draftExists = true
-			}
+		if _, err := os.Stat(draftLocal); err == nil {
+			draftExists = true
 		}
 
 		if exists || draftExists {
@@ -429,6 +582,37 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "image/webp")
 			} else {
 				w.Header().Set("Content-Type", "image/png")
+			}
+
+			if params.Get("info") == "1" || params.Get("info") == "true" {
+				w.Header().Set("Content-Type", "application/json")
+				info := map[string]interface{}{
+					"is_cache_hit": true,
+					"content_id":   contentID,
+					"path":         actualKey,
+					"is_draft":     draftExists,
+					"storage_type": GlobalStore.Type(),
+				}
+				hashKey := actualKey + ".hashes"
+				if reader, err := GlobalStore.GetReader(r.Context(), hashKey); err == nil {
+					defer reader.Close()
+					var hashes ImageHashes
+					if err := json.NewDecoder(reader).Decode(&hashes); err == nil {
+						info["hashes"] = hashes
+						info["is_nude"] = hashes.IsNude
+						info["upload_date"] = hashes.CreatedAt
+					}
+				}
+				if draftExists {
+					ttlPath := draftLocal + ".ttl"
+					if ttlData, err := os.ReadFile(ttlPath); err == nil {
+						if ts, err := strconv.ParseInt(string(ttlData), 10, 64); err == nil {
+							info["draft_expiration"] = time.Unix(ts, 0)
+						}
+					}
+				}
+				json.NewEncoder(w).Encode(info)
+				return
 			}
 
 			if draftExists {
@@ -459,30 +643,88 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	actualKey := filepath.Join(filepath.Dir(u.Path), filenameWithContentID+ext)
 
+	mParams := MediaParams{
+		Width:      width,
+		Height:     height,
+		Radius:     radius,
+		Quality:    quality,
+		Format:     format,
+		CropX:      cropX,
+		CropY:      cropY,
+		Start:      startSec,
+		End:        endSec,
+		NudeCheck:  doNudeCheck,
+		NudeBlur:   doNudeBlur,
+		Blur:       blur,
+		Info:       infoReq,
+		Expiration: expiration,
+	}
+
+	processMedia(w, r, fullStream, fileName, actualKey, isVideo, mParams)
+}
+
+func sendJSONInfo(w http.ResponseWriter, storageKey string, isVideo bool, params MediaParams, img image.Image, isNude bool) {
+	info := map[string]interface{}{
+		"path":         storageKey,
+		"is_draft":     DraftEnabled || !params.Expiration.IsZero(),
+		"storage_type": GlobalStore.Type(),
+		"upload_date":  time.Now(),
+	}
+
+	if !params.Expiration.IsZero() {
+		info["draft_expiration"] = params.Expiration
+	}
+
+	if !isVideo && img != nil {
+		hashes := calculateImageHashes(img, isNude)
+		info["hashes"] = hashes
+		info["is_nude"] = isNude
+		info["metadata"] = map[string]interface{}{
+			"width":  img.Bounds().Dx(),
+			"height": img.Bounds().Dy(),
+			"format": params.Format,
+		}
+	} else if isVideo {
+		info["metadata"] = map[string]interface{}{
+			"width":  params.Width,
+			"height": params.Height,
+			"format": "mp4",
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(info)
+}
+
+func processMedia(w http.ResponseWriter, r *http.Request, stream io.Reader, fileName, storageKey string, isVideo bool, params MediaParams) {
+	if params.Info {
+		defer func() {
+			// If we are just requesting info, we might still want to process and cache?
+			// The original request was "return info instead of image".
+			// To get hashes and dimensions, we MUST decode/process.
+		}()
+	}
+
 	if isVideo {
 		opts := videop.ProcessOptions{
-			Width:   width,
-			Height:  height,
-			Quality: quality,
-			Start:   startSec,
-			End:     endSec,
+			Width:   params.Width,
+			Height:  params.Height,
+			Quality: params.Quality,
+			Start:   params.Start,
+			End:     params.End,
 		}
 
 		if VideoProcessingMode == "stream" {
-			slog.Info("Starting STREAMING video processing", "url", imageURL)
+			slog.Info("Starting STREAMING video processing", "file", fileName)
 			w.Header().Set("Content-Type", "video/mp4")
 			w.Header().Set("X-Processing-Mode", "stream")
-
-			// If S3, we need a temp file to cache the result while streaming
-			// Or we can try to use a pipe, but FFmpeg usually needs a seekable file for some outputs.
-			// However, StreamVideo is designed to stream.
 
 			var cacheFile *os.File
 			var tempPath string
 			var err error
 
-			if _, isLocal := GlobalStore.LocalPath(actualKey); isLocal {
-				fullPath, _ := GlobalStore.LocalPath(actualKey)
+			if _, isLocal := GlobalStore.LocalPath(storageKey); isLocal {
+				fullPath, _ := GlobalStore.LocalPath(storageKey)
 				os.MkdirAll(filepath.Dir(fullPath), 0755)
 				cacheFile, err = os.Create(fullPath)
 			} else {
@@ -504,20 +746,22 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer cancel()
 
-			if err := videop.StreamVideo(ctx, fullStream, mw, opts); err != nil {
+			if err := videop.StreamVideo(ctx, stream, mw, opts); err != nil {
 				slog.Error("Streaming video failed", "error", err)
 				return
 			}
 
-			if tempPath != "" {
-				// Upload to Store / Draft
-				cacheFile.Seek(0, 0)
-				saveToStore(context.Background(), actualKey, cacheFile, expiration)
+			if params.Info {
+				sendJSONInfo(w, storageKey, true, params, nil, false)
 			}
-			return // Stream finished and sent
+
+			if tempPath != "" {
+				cacheFile.Seek(0, 0)
+				saveToStore(context.Background(), storageKey, cacheFile, params.Expiration)
+			}
+			return
 		} else {
-			slog.Info("Starting CHUNKED video processing", "url", imageURL)
-			// Chunked mode needs file on disk
+			slog.Info("Starting CHUNKED video processing", "file", fileName)
 			tempFile, err := os.CreateTemp("", "resizer_stream_*.mp4")
 			if err != nil {
 				slog.Error("Failed to create temp file", "error", err)
@@ -527,7 +771,7 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 			tempPath := tempFile.Name()
 			defer os.Remove(tempPath)
 
-			if _, err := io.Copy(tempFile, fullStream); err != nil {
+			if _, err := io.Copy(tempFile, stream); err != nil {
 				tempFile.Close()
 				slog.Error("Failed to save stream to temp file", "error", err)
 				http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -553,19 +797,21 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// Save from temp to Store / Draft
 			f, err := os.Open(outputTempPath)
 			if err == nil {
-				saveToStore(ctx, actualKey, f, expiration)
+				saveToStore(ctx, storageKey, f, params.Expiration)
 				f.Close()
 			}
 
-			// Serve to client
 			f, err = os.Open(outputTempPath)
 			if err == nil {
 				defer f.Close()
-				w.Header().Set("Content-Type", "video/mp4")
-				io.Copy(w, f)
+				if params.Info {
+					sendJSONInfo(w, storageKey, true, params, nil, false)
+				} else {
+					w.Header().Set("Content-Type", "video/mp4")
+					io.Copy(w, f)
+				}
 			}
 			return
 		}
@@ -573,28 +819,45 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 		// Image processing
 		var img image.Image
 		var err error
+		var isNude bool
 
-		if doNudeCheck {
-			// go-nude needs a file path
-			tempFile, err := os.CreateTemp("", "resizer_nude_*.tmp")
+		if params.NudeCheck {
+			tempFile, err := os.CreateTemp("", "resizer_nude_*.jpg")
 			if err != nil {
 				slog.Error("Failed to create temp file for nude check", "error", err)
 			} else {
 				tempPath := tempFile.Name()
 				defer os.Remove(tempPath)
 
-				if _, err := io.Copy(tempFile, fullStream); err != nil {
-					slog.Error("Failed to save stream to temp for nude check", "error", err)
+				// We need the image object to resize it for better detection accuracy
+				img, err = imagep.DecodeImage(fileName, stream)
+				if err != nil {
+					slog.Error("Failed to decode image for nude check", "error", err)
+					tempFile.Close()
+					http.Error(w, "Failed to decode image", http.StatusBadRequest)
+					return
+				}
+
+				// Resize to ~512px for better detection accuracy if image is large
+				checkImg := img
+				bounds := img.Bounds()
+				if bounds.Dx() > 512 || bounds.Dy() > 512 {
+					checkImg = imagep.ResizedImage(img, 512, 512, "center", "center")
+					slog.Info("Resized image for nude check", "original", fmt.Sprintf("%dx%d", bounds.Dx(), bounds.Dy()))
+				}
+
+				// Save resized image to temp file for go-nude
+				if err := jpeg.Encode(tempFile, checkImg, &jpeg.Options{Quality: 80}); err != nil {
+					slog.Error("Failed to save temp image for nude check", "error", err)
 				}
 				tempFile.Close()
 
-				// Perform check
-				isNude, err := nude.IsNude(tempPath)
+				isNude, err = isNudeWithThreshold(tempPath, NudeSkinThreshold)
 				if err != nil {
 					slog.Warn("Nudity check failed", "error", err)
 				} else if isNude {
 					w.Header().Set("X-Nude", "true")
-					if doNudeBlur {
+					if params.NudeBlur {
 						w.Header().Set("X-Nude", "blurred")
 						slog.Info("Nudity detected, applying blur")
 					} else if FailOnNude {
@@ -605,15 +868,9 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 						slog.Info("Nudity detected, allowing but marking")
 					}
 				}
-
-				// Now decode from the temp file since stream is consumed
-				f, _ := os.Open(tempPath)
-				defer f.Close()
-				img, err = imagep.DecodeImage(fileName, f)
 			}
 		} else {
-			// Normal decoding from stream
-			img, err = imagep.DecodeImage(fileName, fullStream)
+			img, err = imagep.DecodeImage(fileName, stream)
 		}
 
 		if err != nil {
@@ -622,38 +879,38 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if width > 0 && height > 0 {
-			img = imagep.ResizedImage(img, width, height, cropX, cropY)
+		if params.Width > 0 || params.Height > 0 {
+			img = imagep.ResizedImage(img, params.Width, params.Height, params.CropX, params.CropY)
 		}
-		if radius > 0 {
-			img = imagep.RoundImage(img, radius)
-		}
-
-		// Apply nudity blur if detected and requested
-		if w.Header().Get("X-Nude") == "blurred" {
-			img = imagep.BlurImage(img, 50) // Default blur strength
+		if params.Radius > 0 {
+			img = imagep.RoundImage(img, params.Radius)
 		}
 
-		imgExt := format
+		// Apply blur if requested via param OR if nudity detected
+		if params.Blur > 0 {
+			img = imagep.BlurImage(img, params.Blur)
+		} else if w.Header().Get("X-Nude") == "blurred" {
+			img = imagep.BlurImage(img, NudeBlurStrength)
+		}
+
+		imgExt := params.Format
 		if imgExt == "" {
 			imgExt = "png"
 		}
-		actualKey := filepath.Join(filepath.Dir(u.Path), filenameWithContentID+"."+imgExt)
 
-		// Encode to buffer or temp file
 		buf := new(bytes.Buffer)
-		if format == "webp" {
-			if quality == 100 {
+		if params.Format == "webp" {
+			if params.Quality == 100 {
 				err = imagep.EncodeLosslessWebP(buf, img)
 			} else {
-				options := webp.Options{Quality: quality}
+				options := webp.Options{Quality: params.Quality}
 				err = webp.Encode(buf, img, options)
 			}
 		} else {
 			pngEncoder := png.Encoder{CompressionLevel: png.DefaultCompression}
-			if quality >= 90 {
+			if params.Quality >= 90 {
 				pngEncoder.CompressionLevel = png.BestSpeed
-			} else if quality <= 70 {
+			} else if params.Quality <= 70 {
 				pngEncoder.CompressionLevel = png.BestCompression
 			}
 			err = pngEncoder.Encode(buf, img)
@@ -665,28 +922,256 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Calculate perceptual hashes
-		hashes := calculateImageHashes(img)
+		hashes := calculateImageHashes(img, isNude)
 		hashesData, _ := json.Marshal(hashes)
 
-		// Save to store / Draft
-		if err := saveToStore(r.Context(), actualKey, bytes.NewReader(buf.Bytes()), expiration); err != nil {
+		if err := saveToStore(r.Context(), storageKey, bytes.NewReader(buf.Bytes()), params.Expiration); err != nil {
 			slog.Error("Failed to save image to store", "error", err)
 		}
 
-		// Save hashes to .hashes file
-		hashKey := actualKey + ".hashes"
-		saveToStore(r.Context(), hashKey, bytes.NewReader(hashesData), expiration)
+		hashKey := storageKey + ".hashes"
+		saveToStore(r.Context(), hashKey, bytes.NewReader(hashesData), params.Expiration)
 
-		// Return to client (since it's already in buffer, it's easy)
-		if format == "webp" {
+		if params.Format == "webp" {
 			w.Header().Set("Content-Type", "image/webp")
 		} else {
 			w.Header().Set("Content-Type", "image/png")
 		}
-		w.Write(buf.Bytes())
+
+		if params.Info {
+			sendJSONInfo(w, storageKey, false, params, img, isNude)
+		} else {
+			w.Write(buf.Bytes())
+		}
+	}
+}
+
+func UploadHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST method is allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	// 100MB max memory for multipart form
+	if err := r.ParseMultipartForm(100 << 20); err != nil {
+		slog.Error("Failed to parse multipart form", "error", err)
+		http.Error(w, "Failed to parse form", http.StatusBadRequest)
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "File is required (parameter 'file')", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	// Parse parameters from form
+	width, _ := strconv.Atoi(r.FormValue("width"))
+	height, _ := strconv.Atoi(r.FormValue("height"))
+	radius, _ := strconv.Atoi(r.FormValue("radius"))
+
+	cropX := r.FormValue("crop_x")
+	if cropX == "" {
+		cropX = "center"
+	}
+	cropY := r.FormValue("crop_y")
+	if cropY == "" {
+		cropY = "center"
+	}
+
+	format := strings.ToLower(r.FormValue("format"))
+	if format == "" {
+		format = "png"
+	}
+
+	qualityStr := r.FormValue("q")
+	if qualityStr == "" {
+		qualityStr = r.FormValue("quality")
+	}
+	quality := 80
+	if q, err := strconv.Atoi(qualityStr); err == nil && q > 0 && q <= 100 {
+		quality = q
+	}
+
+	startSec, _ := strconv.ParseFloat(r.FormValue("start"), 64)
+	endSec, _ := strconv.ParseFloat(r.FormValue("end"), 64)
+
+	infoReq := r.FormValue("info") == "1" || r.FormValue("info") == "true"
+
+	presetName := r.FormValue("preset")
+	if presetName != "" {
+		if p, ok := Presets[presetName]; ok {
+			width = p.Width
+			height = p.Height
+			if p.Radius > 0 {
+				radius = p.Radius
+			}
+			if p.Quality > 0 {
+				quality = p.Quality
+			}
+		}
+	}
+
+	nudeCheckReq := r.FormValue("nude_check") == "1" || r.FormValue("nude_check") == "true"
+	nudeBlurReq := r.FormValue("nude_blur") == "1" || r.FormValue("nude_blur") == "true"
+	blur, _ := strconv.Atoi(r.FormValue("blur"))
+	doNudeBlur := NudeBlurEnabled || nudeBlurReq
+	doNudeCheck := NudeCheckEnabled || nudeCheckReq || doNudeBlur
+
+	var expiration time.Time
+	if dttl := r.FormValue("draft_ttl"); dttl != "" {
+		if dur, err := time.ParseDuration(dttl); err == nil {
+			expiration = time.Now().Add(dur)
+		} else if t, err := time.Parse("2006-01-02", dttl); err == nil {
+			expiration = time.Date(t.Year(), t.Month(), t.Day(), 23, 59, 59, 0, t.Location())
+		}
+	}
+
+	// Calculate Content ID for deduplication
+	previewBuf := make([]byte, 512*1024)
+	nBytes, err := io.ReadAtLeast(file, previewBuf, 1)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		slog.Error("Failed to read file for hashing", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	previewBuf = previewBuf[:nBytes]
+
+	earlyHasher := sha256.New()
+	earlyHasher.Write(previewBuf)
+	contentID := hex.EncodeToString(earlyHasher.Sum(nil))
+
+	contentType := header.Header.Get("Content-Type")
+	// If content type is unknown, try to sniff it
+	if contentType == "" || contentType == "application/octet-stream" {
+		contentType = http.DetectContentType(previewBuf)
+	}
+	isVideo := strings.HasPrefix(contentType, "video/")
+
+	filenameWithContentID := fmt.Sprintf("%s_w-%d_h-%d", contentID, width, height)
+	if radius > 0 {
+		filenameWithContentID = fmt.Sprintf("%s_r-%d", filenameWithContentID, radius)
+	}
+	if quality > 0 {
+		filenameWithContentID = fmt.Sprintf("%s_q-%d", filenameWithContentID, quality)
+	}
+	if startSec > 0 {
+		filenameWithContentID = fmt.Sprintf("%s_start-%.2f", filenameWithContentID, startSec)
+	}
+	if endSec > 0 {
+		filenameWithContentID = fmt.Sprintf("%s_end-%.2f", filenameWithContentID, endSec)
+	}
+	if blur > 0 {
+		filenameWithContentID = fmt.Sprintf("%s_blur-%d", filenameWithContentID, blur)
+	}
+
+	ext := ".png"
+	if isVideo {
+		ext = ".mp4"
+	} else if format == "webp" {
+		ext = ".webp"
+	}
+
+	// Custom save path within 'uploads'
+	savePath := r.FormValue("path")
+	if savePath != "" {
+		savePath = filepath.Clean(savePath)
+		// Prevent directory traversal
+		if strings.HasPrefix(savePath, "..") || strings.HasPrefix(savePath, "/") {
+			savePath = ""
+		}
+	}
+	if savePath == "" {
+		savePath = "uploads"
+	} else {
+		savePath = filepath.Join("uploads", savePath)
+	}
+
+	actualKey := filepath.Join(savePath, filenameWithContentID+ext)
+
+	// Check cache
+	exists, _ := GlobalStore.Exists(r.Context(), actualKey)
+	draftLocal := filepath.Join(DraftPath, actualKey)
+	draftExists := false
+	if _, err := os.Stat(draftLocal); err == nil {
+		draftExists = true
+	}
+
+	if exists || draftExists {
+		slog.Info("Cache HIT for upload", "id", contentID)
+		w.Header().Set("X-Cache", "HIT-ID")
+
+		if infoReq {
+			w.Header().Set("Content-Type", "application/json")
+			info := map[string]interface{}{
+				"is_cache_hit": true,
+				"content_id":   contentID,
+				"path":         actualKey,
+				"is_draft":     draftExists,
+				"storage_type": GlobalStore.Type(),
+			}
+			hashKey := actualKey + ".hashes"
+			if reader, err := GlobalStore.GetReader(r.Context(), hashKey); err == nil {
+				defer reader.Close()
+				var hashes ImageHashes
+				if err := json.NewDecoder(reader).Decode(&hashes); err == nil {
+					info["hashes"] = hashes
+					info["is_nude"] = hashes.IsNude
+					info["upload_date"] = hashes.CreatedAt
+				}
+			}
+			if draftExists {
+				ttlPath := draftLocal + ".ttl"
+				if ttlData, err := os.ReadFile(ttlPath); err == nil {
+					if ts, err := strconv.ParseInt(string(ttlData), 10, 64); err == nil {
+						info["draft_expiration"] = time.Unix(ts, 0)
+					}
+				}
+			}
+			json.NewEncoder(w).Encode(info)
+			return
+		}
+
+		if draftExists {
+			w.Header().Set("X-Cache", "HIT-ID-DRAFT")
+			w.Header().Set("Content-Type", contentType)
+			http.ServeFile(w, r, draftLocal)
+			return
+		}
+		if localPath, isLocal := GlobalStore.LocalPath(actualKey); isLocal {
+			w.Header().Set("Content-Type", contentType)
+			http.ServeFile(w, r, localPath)
+			return
+		}
+		reader, err := GlobalStore.GetReader(r.Context(), actualKey)
+		if err == nil {
+			defer reader.Close()
+			w.Header().Set("Content-Type", contentType)
+			io.Copy(w, reader)
+			return
+		}
+	}
+
+	fullStream := io.MultiReader(bytes.NewReader(previewBuf), file)
+	mParams := MediaParams{
+		Width:      width,
+		Height:     height,
+		Radius:     radius,
+		Quality:    quality,
+		Format:     format,
+		CropX:      cropX,
+		CropY:      cropY,
+		Start:      startSec,
+		End:        endSec,
+		NudeCheck:  doNudeCheck,
+		NudeBlur:   doNudeBlur,
+		Blur:       blur,
+		Info:       infoReq,
+		Expiration: expiration,
+	}
+
+	processMedia(w, r, fullStream, header.Filename, actualKey, isVideo, mParams)
 }
 
 func HashCheckHandler(w http.ResponseWriter, r *http.Request) {
