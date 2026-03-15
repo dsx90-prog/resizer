@@ -1,10 +1,20 @@
 package handlers
 
 import (
+	"image"
 	"net/http"
-	"net/http/httptest" // I will add this if it was missing or fix if it was there
+	"net/http/httptest"
 	"testing"
 )
+
+func TestCalculateImageHashes(t *testing.T) {
+	img1 := image.NewRGBA(image.Rect(0, 0, 100, 100))
+	hashes := calculateImageHashes(img1)
+
+	if hashes.Average == "" || hashes.Perceptual == "" || hashes.Difference == "" {
+		t.Errorf("expected all hashes to be non-empty, got %+v", hashes)
+	}
+}
 
 func TestResizeHandler_MissingURL(t *testing.T) {
 	req, err := http.NewRequest("GET", "/", nil)

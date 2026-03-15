@@ -193,6 +193,7 @@ func main() {
 	http.HandleFunc("/info", handlers.URLInfoHandler)
 	http.HandleFunc("/sign", handlers.SignatureGenHandler)
 	http.HandleFunc("/confirm", handlers.ConfirmHandler)
+	http.HandleFunc("/similar", handlers.SimilarHandler)
 
 	// Запуск сервера в горутине
 	go func() {

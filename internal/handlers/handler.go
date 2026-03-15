@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/corona10/goimagehash"
 	"github.com/gen2brain/webp"
 	"github.com/koyachi/go-nude"
 )
@@ -61,6 +62,24 @@ func getFileHash(filePath string) string {
 	}
 	hash := sha256.Sum256(data)
 	return hex.EncodeToString(hash[:])
+}
+
+type ImageHashes struct {
+	Average    string `json:"a_hash"`
+	Perceptual string `json:"p_hash"`
+	Difference string `json:"d_hash"`
+}
+
+func calculateImageHashes(img image.Image) ImageHashes {
+	aHash, _ := goimagehash.AverageHash(img)
+	pHash, _ := goimagehash.PerceptionHash(img)
+	dHash, _ := goimagehash.DifferenceHash(img)
+
+	return ImageHashes{
+		Average:    aHash.ToString(),
+		Perceptual: pHash.ToString(),
+		Difference: dHash.ToString(),
+	}
 }
 
 func verifySignature(params url.Values, key string) bool {
@@ -630,10 +649,18 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Calculate perceptual hashes
+		hashes := calculateImageHashes(img)
+		hashesData, _ := json.Marshal(hashes)
+
 		// Save to store / Draft
 		if err := saveToStore(r.Context(), actualKey, buf, expiration); err != nil {
 			slog.Error("Failed to save image to store", "error", err)
 		}
+
+		// Save hashes to .hashes file
+		hashKey := actualKey + ".hashes"
+		saveToStore(r.Context(), hashKey, bytes.NewReader(hashesData), expiration)
 
 		// Return to client (since it's already in buffer, it's easy)
 		if format == "webp" {
@@ -956,4 +983,89 @@ func CleanupDrafts() {
 			os.Remove(ttlPath)
 		}
 	}
+}
+
+func SimilarHandler(w http.ResponseWriter, r *http.Request) {
+	rawURL := r.URL.Query().Get("url")
+	if rawURL == "" {
+		http.Error(w, "Parameter 'url' is required", http.StatusBadRequest)
+		return
+	}
+
+	threshold, _ := strconv.Atoi(r.URL.Query().Get("threshold"))
+	if threshold == 0 {
+		threshold = 5 // Default Hamming distance threshold
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		http.Error(w, "Invalid URL", http.StatusBadRequest)
+		return
+	}
+
+	// 1. Download and get hash of the target image
+	resp, err := service.DownloadStream(rawURL, r.Header)
+	if err != nil {
+		http.Error(w, "Failed to download image", http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	img, _, err := image.Decode(resp.Body)
+	if err != nil {
+		http.Error(w, "Failed to decode image", http.StatusBadRequest)
+		return
+	}
+
+	targetPHash, _ := goimagehash.PerceptionHash(img)
+
+	// 2. Scan storage for similar images
+	// Note: This is a naive implementation that scans the directory.
+	// In production, you'd use a database with spatial indexing or a specialized vector store.
+	prefix := filepath.Dir(u.Path)
+	files, err := GlobalStore.List(r.Context(), prefix)
+	if err != nil {
+		http.Error(w, "Failed to list storage", http.StatusInternalServerError)
+		return
+	}
+
+	type match struct {
+		Path     string `json:"path"`
+		Distance int    `json:"distance"`
+	}
+	var matches []match
+
+	for _, name := range files {
+		if strings.HasSuffix(name, ".hashes") {
+			reader, err := GlobalStore.GetReader(r.Context(), name)
+			if err != nil {
+				continue
+			}
+			var hashes ImageHashes
+			if err := json.NewDecoder(reader).Decode(&hashes); err == nil {
+				pHash, err := goimagehash.ImageHashFromString(hashes.Perceptual)
+				if err == nil {
+					dist, _ := targetPHash.Distance(pHash)
+					if dist <= threshold {
+						matches = append(matches, match{
+							Path:     strings.TrimSuffix(name, ".hashes"),
+							Distance: dist,
+						})
+					}
+				}
+			}
+			reader.Close()
+		}
+	}
+
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].Distance < matches[j].Distance
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"url":     rawURL,
+		"hash":    targetPHash.ToString(),
+		"matches": matches,
+	})
 }
