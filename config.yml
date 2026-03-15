@@ -11,7 +11,24 @@ security:
 #    - yandex.ru
 
 storage:
+  type: local # local или s3
   path: artefacts
+  s3:
+    endpoint: "" # Например, s3.amazonaws.com или minio-url
+    region: "us-east-1"
+    access_key: ""
+    secret_key: ""
+    bucket: ""
+    use_ssl: true
+  draft:
+    enabled: false
+    ttl: "1h"
+  download:
+    forward_headers: false # Пробрасывать ли заголовки клиента целевому серверу
+    user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    headers:
+      "Accept-Language": "en-US,en;q=0.9"
+      "Cache-Control": "no-cache"
 
 video:
   processing_mode: stream # Options: chunked, stream

@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/signal"
 	"resizer/internal/handlers"
+	"resizer/internal/service"
+	"resizer/pkg/storage"
 	"strings"
 	"syscall"
 	"time"
@@ -27,7 +29,25 @@ type Config struct {
 		} `yaml:"signature"`
 	} `yaml:"security"`
 	Storage struct {
+		Type string `yaml:"type"`
 		Path string `yaml:"path"`
+		S3   struct {
+			Endpoint  string `yaml:"endpoint"`
+			Region    string `yaml:"region"`
+			AccessKey string `yaml:"access_key"`
+			SecretKey string `yaml:"secret_key"`
+			Bucket    string `yaml:"bucket"`
+			UseSSL    bool   `yaml:"use_ssl"`
+		} `yaml:"s3"`
+		Download struct {
+			ForwardHeaders bool              `yaml:"forward_headers"`
+			UserAgent      string            `yaml:"user_agent"`
+			Headers        map[string]string `yaml:"headers"`
+		} `yaml:"download"`
+		Draft struct {
+			Enabled bool   `yaml:"enabled"`
+			TTL     string `yaml:"ttl"`
+		} `yaml:"draft"`
 	} `yaml:"storage"`
 	Video struct {
 		ProcessingMode string `yaml:"processing_mode"`
@@ -94,6 +114,55 @@ func main() {
 	handlers.AllowSignatureGen = cfg.Security.Signature.AllowSign
 	handlers.SecurityKey = cfg.Security.Signature.Key
 	handlers.StoragePath = cfg.Storage.Path
+
+	// Initialize Storage Provider
+	ctx := context.Background()
+	if cfg.Storage.Type == "s3" {
+		s3Store, err := storage.NewS3Storage(ctx,
+			cfg.Storage.S3.Endpoint,
+			cfg.Storage.S3.Region,
+			cfg.Storage.S3.AccessKey,
+			cfg.Storage.S3.SecretKey,
+			cfg.Storage.S3.Bucket,
+			cfg.Storage.S3.UseSSL,
+		)
+		if err != nil {
+			slog.Error("Failed to initialize S3 storage", "error", err)
+			os.Exit(1)
+		}
+		handlers.GlobalStore = s3Store
+		slog.Info("Using S3 storage provider", "bucket", cfg.Storage.S3.Bucket)
+	} else {
+		handlers.GlobalStore = &storage.LocalStorage{BasePath: cfg.Storage.Path}
+		slog.Info("Using local storage provider", "path", cfg.Storage.Path)
+	}
+
+	service.ForwardClientHeaders = cfg.Storage.Download.ForwardHeaders
+	service.DownloadHeaders = make(map[string]string)
+	if cfg.Storage.Download.UserAgent != "" {
+		service.DownloadHeaders["User-Agent"] = cfg.Storage.Download.UserAgent
+	}
+	for k, v := range cfg.Storage.Download.Headers {
+		service.DownloadHeaders[k] = v
+	}
+
+	handlers.DraftEnabled = cfg.Storage.Draft.Enabled
+	if cfg.Storage.Draft.TTL != "" {
+		if ttl, err := time.ParseDuration(cfg.Storage.Draft.TTL); err == nil {
+			handlers.DraftTTL = ttl
+		}
+	}
+
+	// Start Draft Cleanup Worker
+	if handlers.DraftEnabled {
+		go func() {
+			ticker := time.NewTicker(10 * time.Minute)
+			for range ticker.C {
+				handlers.CleanupDrafts()
+			}
+		}()
+	}
+
 	handlers.VideoProcessingMode = cfg.Video.ProcessingMode
 	handlers.AllowCustomDimensions = cfg.Transformations.AllowCustom
 	handlers.Presets = make(map[string]handlers.PresetConfig)
@@ -117,6 +186,7 @@ func main() {
 	http.HandleFunc("/check", handlers.HashCheckHandler)
 	http.HandleFunc("/info", handlers.URLInfoHandler)
 	http.HandleFunc("/sign", handlers.SignatureGenHandler)
+	http.HandleFunc("/confirm", handlers.ConfirmHandler)
 
 	// Запуск сервера в горутине
 	go func() {

@@ -13,6 +13,9 @@ import (
 	"time"
 )
 
+var DownloadHeaders map[string]string
+var ForwardClientHeaders bool = false
+
 func CheckField(newFilePath string) bool {
 	_, err := os.Stat(newFilePath)
 	if err == nil {
@@ -26,8 +29,8 @@ func CheckField(newFilePath string) bool {
 	return false
 }
 
-func DownloadImage(fileName, imageURL string) (image.Image, error) {
-	resp, err := downloadRequest(imageURL)
+func DownloadImage(fileName, imageURL string, clientHeaders http.Header) (image.Image, error) {
+	resp, err := downloadRequest(imageURL, clientHeaders)
 	if err != nil {
 		return nil, err
 	}
@@ -48,8 +51,8 @@ type DownloadMeta struct {
 }
 
 // DownloadToDisk downloads arbitrary file to a given directory, returning metadata
-func DownloadToDisk(imageURL string, destDir string) (*DownloadMeta, error) {
-	resp, err := downloadRequest(imageURL)
+func DownloadToDisk(imageURL string, destDir string, clientHeaders http.Header) (*DownloadMeta, error) {
+	resp, err := downloadRequest(imageURL, clientHeaders)
 	if err != nil {
 		return nil, err
 	}
@@ -93,11 +96,11 @@ func DownloadToDisk(imageURL string, destDir string) (*DownloadMeta, error) {
 	}, nil
 }
 
-func DownloadStream(imageURL string) (*http.Response, error) {
-	return downloadRequest(imageURL)
+func DownloadStream(imageURL string, clientHeaders http.Header) (*http.Response, error) {
+	return downloadRequest(imageURL, clientHeaders)
 }
 
-func downloadRequest(imageURL string) (*http.Response, error) {
+func downloadRequest(imageURL string, clientHeaders http.Header) (*http.Response, error) {
 	client := &http.Client{
 		Timeout: 30 * time.Second, // Timeout для всех операций с удаленным сервером
 	}
@@ -106,8 +109,21 @@ func downloadRequest(imageURL string) (*http.Response, error) {
 		return nil, err
 	}
 
-	// Добавляем современный User-Agent, чтобы избежать блокировок (ошибка 403)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	for k, v := range DownloadHeaders {
+		req.Header.Set(k, v)
+	}
+
+	if ForwardClientHeaders && clientHeaders != nil {
+		for k, v := range clientHeaders {
+			// Skip security-sensitive headers or ones we should control
+			if k == "Host" || k == "Connection" {
+				continue
+			}
+			for _, val := range v {
+				req.Header.Add(k, val)
+			}
+		}
+	}
 
 	response, err := client.Do(req)
 	if err != nil {

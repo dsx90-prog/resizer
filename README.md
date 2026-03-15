@@ -18,7 +18,8 @@
 
 ### Системные функции
 *   **Smart Content ID**: Хэширование первых 512 КБ файла для мгновенного поиска дубликатов в кэше, даже если URL разные.
-*   **Многоуровневое кэширование**: Сохранение результатов на диск с учетом всех параметров обработки.
+*   **Многоуровневое кэширование**: Сохранение результатов на диск или в S3 с учетом всех параметров обработки.
+*   **Draft Storage**: Поддержка временного хранения (черновиков) перед окончательной загрузкой в облако.
 *   **Graceful Shutdown**: Безопасная остановка сервера с ожиданием завершения текущих задач.
 
 ## 🛠 Установка и зависимости
@@ -49,13 +50,26 @@ security:
     allow_sign: false       # Разрешить ли эндпоинт /sign (лучше выклоючать в прод)
     key: "secret-key"       # Ключ для подписи параметров
 storage:
-  path: "artefacts"
+  type: local               # Режимы: local, s3
+  path: "artefacts"         # Путь для локального кэша
+  s3:
+    endpoint: "s3.aws.com"  # URL S3-совместимого хранилища
+    bucket: "my-cache"
+    access_key: "..."
+    secret_key: "..."
+    use_ssl: true
+  draft:                    # Режим черновика (только для S3)
+    enabled: true           # Сохранять локально до вызова /confirm
+    ttl: "1h"               # Время жизни черновика по умолчанию
+  download:
+    user_agent: "Mozilla/5.0..." # Кастомный User-Agent для скачивания
+    forward_headers: false   # Пробрасывать ли заголовки клиента
 video:
   processing_mode: stream   # Режимы: stream, chunked
 transformations:
   allow_custom: true        # Разрешать ли произвольные width/height
   presets:                  # Именованные наборы параметров
-    avatar: { width: 100, height: 100, radius: 50 }
+    avatar: { width: 100, height: 100, radius: 50, quality: 90 }
     thumbnail: { width: 300, height: 300 }
 ```
 
@@ -72,7 +86,18 @@ transformations:
 | `start`, `end` | (Видео) фрагмент для обрезки | Секунды (float) |
 | `format` | Выходной формат | `png`, `webp` (картинки), `mp4` |
 | `q` | Качество сжатия (1-100) | 80 (по умолчанию) |
+| `draft_ttl` | Включить режим черновика и указать время | `1h`, `2026-03-20` |
 | `s` | HMAC-SHA256 подпись параметров | Hex строка |
+
+### 2. Подтверждение черновика (`/confirm`)
+Переносит файл из локальной папки черновиков в основное хранилище (S3).
+`POST /confirm?path={relative_path}` или `POST /confirm?hash={content_id}`
+
+Пример (по пути):
+`curl -X POST "http://localhost:8085/confirm?path=images/photo_resized-200x200.png"`
+
+Пример (по хэшу — подтверждает все варианты этого изображения):
+`curl -X POST "http://localhost:8085/confirm?hash=a1b2c3d4..."`
 
 ### 2. Проверка хэша (`/check`)
 Узнать, есть ли файл с таким Smart Content ID в системе.

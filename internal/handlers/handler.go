@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"resizer/internal/service"
 	imagep "resizer/pkg/image"
+	"resizer/pkg/storage"
 	videop "resizer/pkg/video"
 	"sort"
 	"strconv"
@@ -35,6 +36,11 @@ var AllowSignatureGen bool = true
 var SecurityKey string = ""
 var AllowCustomDimensions bool = true
 var Presets map[string]PresetConfig
+var GlobalStore storage.StorageProvider
+
+var DraftEnabled bool = false
+var DraftTTL time.Duration = time.Hour
+var DraftPath string = "temp_drafts"
 
 type PresetConfig struct {
 	Width   int
@@ -87,9 +93,50 @@ func calculateSignature(params url.Values, key string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
+func saveToStore(ctx context.Context, path string, data io.Reader, expiresAt time.Time) error {
+	if DraftEnabled || !expiresAt.IsZero() {
+		// Save locally to temp_drafts
+		fullPath := filepath.Join(DraftPath, path)
+		os.MkdirAll(filepath.Dir(fullPath), 0755)
+		f, err := os.Create(fullPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(f, data)
+		if err != nil {
+			return err
+		}
+
+		// Save TTL meta if specific expiration provided
+		if !expiresAt.IsZero() {
+			ttlPath := fullPath + ".ttl"
+			os.WriteFile(ttlPath, []byte(strconv.FormatInt(expiresAt.Unix(), 10)), 0644)
+		}
+
+		slog.Info("Saved to DRAFT storage", "path", path, "expiresAt", expiresAt)
+		return nil
+	}
+	return GlobalStore.Save(ctx, path, data)
+}
+
 func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 	// Получить параметры из URL
 	params := r.URL.Query()
+
+	var expiration time.Time
+	if dttl := params.Get("draft_ttl"); dttl != "" {
+		// Try duration first (1h, 30m)
+		if dur, err := time.ParseDuration(dttl); err == nil {
+			expiration = time.Now().Add(dur)
+		} else {
+			// Try date YYYY-MM-DD
+			if t, err := time.Parse("2006-01-02", dttl); err == nil {
+				// Set to end of day (23:59:59)
+				expiration = time.Date(t.Year(), t.Month(), t.Day(), 23, 59, 59, 0, t.Location())
+			}
+		}
+	}
 
 	// 0. Verify signature if enabled
 	if SignatureEnabled {
@@ -224,43 +271,66 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Сначала мы не знаем точное расширение (mp4/png/webp), поэтому пока просто базовое имя пути к кешу
-	cacheBasePath := filepath.Join(dir, filenameWithoutExtension)
+	// cacheBasePath := filepath.Join(dir, filenameWithoutExtension)
 
 	// Мы пока не знаем формат (video или image), поэтому отправим ответ когда процесс завершится
 	// Но пока проверим, не лежат ли в кеше уже готовые медиафайлы с нужными параметрами
 
 	// Возможные форматы закэшированного результата
 	possibleCacheFiles := []string{
-		cacheBasePath + ".mp4",
-		cacheBasePath + ".png",
-		cacheBasePath + ".webp",
+		filenameWithoutExtension + ".mp4",
+		filenameWithoutExtension + ".png",
+		filenameWithoutExtension + ".webp",
 	}
 
-	for _, cachedFile := range possibleCacheFiles {
-		if service.CheckField(cachedFile) {
+	for _, cachedKey := range possibleCacheFiles {
+		fullKey := filepath.Join(filepath.Dir(u.Path), cachedKey)
+		exists, _ := GlobalStore.Exists(r.Context(), fullKey)
+		if exists {
+			// For info endpoint or similar we might need the original logic,
+			// but here we serve the file.
 			if updateData == "" || ReadMeta(metaPath) == updateData {
 				w.Header().Set("X-Cache", "HIT")
 
-				if strings.HasSuffix(cachedFile, ".webp") {
+				if strings.HasSuffix(cachedKey, ".webp") {
 					w.Header().Set("Content-Type", "image/webp")
-				} else if strings.HasSuffix(cachedFile, ".png") {
+				} else if strings.HasSuffix(cachedKey, ".png") {
 					w.Header().Set("Content-Type", "image/png")
-				} else if strings.HasSuffix(cachedFile, ".mp4") {
+				} else if strings.HasSuffix(cachedKey, ".mp4") {
 					w.Header().Set("Content-Type", "video/mp4")
 				}
 
-				http.ServeFile(w, r, cachedFile)
+				if localPath, isLocal := GlobalStore.LocalPath(fullKey); isLocal {
+					http.ServeFile(w, r, localPath)
+				} else {
+					// Check draft first if S3
+					if DraftEnabled {
+						draftLocal := filepath.Join(DraftPath, fullKey)
+						if _, err := os.Stat(draftLocal); err == nil {
+							w.Header().Set("X-Cache", "HIT-DRAFT")
+							http.ServeFile(w, r, draftLocal)
+							return
+						}
+					}
+
+					reader, err := GlobalStore.GetReader(r.Context(), fullKey)
+					if err == nil {
+						defer reader.Close()
+						io.Copy(w, reader)
+					}
+				}
 				return
 			}
-			dropOldData(dir)
+			// If meta doesn't match, we might need to delete old data in local mode
+			// but for S3 it's more complex. For now, let's keep it simple.
 			break
 		}
 	}
 
-	startDownload := time.Now()
+	// startDownload := time.Now()
 
 	// 1. Start downloading stream to identify content
-	resp, err := service.DownloadStream(imageURL)
+	resp, err := service.DownloadStream(imageURL, r.Header)
 	if err != nil {
 		slog.Error("Failed to start download stream", "url", imageURL, "error", err)
 		http.Error(w, "Failed to download file", http.StatusInternalServerError)
@@ -300,14 +370,29 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 	if endSec > 0 {
 		filenameWithContentID = fmt.Sprintf("%s_end-%.2f", filenameWithContentID, endSec)
 	}
-	contentCacheBasePath := filepath.Join(dir, filenameWithContentID)
+	// contentCacheBasePath := filepath.Join(dir, filenameWithContentID)
 
 	// Check if we have THIS EXACT CONTENT already processed
 	for _, ext := range []string{".mp4", ".webp", ".png"} {
-		actualCachedFile := contentCacheBasePath + ext
-		if service.CheckField(actualCachedFile) {
+		actualKey := filepath.Join(filepath.Dir(u.Path), filenameWithContentID+ext)
+		exists, _ := GlobalStore.Exists(r.Context(), actualKey)
+
+		// Check draft too
+		draftLocal := filepath.Join(DraftPath, actualKey)
+		draftExists := false
+		if DraftEnabled {
+			if _, err := os.Stat(draftLocal); err == nil {
+				draftExists = true
+			}
+		}
+
+		if exists || draftExists {
 			slog.Info("Cache HIT by Content ID signature", "id", contentID)
 			w.Header().Set("X-Cache", "HIT-ID")
+			if draftExists {
+				w.Header().Set("X-Cache", "HIT-ID-DRAFT")
+			}
+
 			if ext == ".mp4" {
 				w.Header().Set("Content-Type", "video/mp4")
 			} else if ext == ".webp" {
@@ -315,24 +400,36 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 			} else {
 				w.Header().Set("Content-Type", "image/png")
 			}
-			http.ServeFile(w, r, actualCachedFile)
+
+			if draftExists {
+				http.ServeFile(w, r, draftLocal)
+				return
+			}
+
+			if localPath, isLocal := GlobalStore.LocalPath(actualKey); isLocal {
+				http.ServeFile(w, r, localPath)
+			} else {
+				reader, err := GlobalStore.GetReader(r.Context(), actualKey)
+				if err == nil {
+					defer reader.Close()
+					io.Copy(w, reader)
+				}
+			}
 			return
 		}
 	}
 
 	// Combine what we read and what's left in the pipe
 	fullStream := io.MultiReader(bytes.NewReader(previewBuf), resp.Body)
-	downloadTime := time.Since(startDownload)
+	// downloadTime := time.Since(startDownload)
 
-	startProcess := time.Now()
-	var finalExt string
-	var finalFilePath string
+	ext := ".png"
+	if isVideo {
+		ext = ".mp4"
+	}
+	actualKey := filepath.Join(filepath.Dir(u.Path), filenameWithContentID+ext)
 
 	if isVideo {
-		finalExt = "mp4"
-		finalFilePath = contentCacheBasePath + "." + finalExt
-		service.CreateDirectory(dir)
-
 		opts := videop.ProcessOptions{
 			Width:   width,
 			Height:  height,
@@ -346,14 +443,32 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "video/mp4")
 			w.Header().Set("X-Processing-Mode", "stream")
 
-			// Write simultaneously to response and cache file
-			cacheFile, err := os.Create(finalFilePath)
+			// If S3, we need a temp file to cache the result while streaming
+			// Or we can try to use a pipe, but FFmpeg usually needs a seekable file for some outputs.
+			// However, StreamVideo is designed to stream.
+
+			var cacheFile *os.File
+			var tempPath string
+			var err error
+
+			if _, isLocal := GlobalStore.LocalPath(actualKey); isLocal {
+				fullPath, _ := GlobalStore.LocalPath(actualKey)
+				os.MkdirAll(filepath.Dir(fullPath), 0755)
+				cacheFile, err = os.Create(fullPath)
+			} else {
+				cacheFile, err = os.CreateTemp("", "resizer_vcache_*.mp4")
+				tempPath = cacheFile.Name()
+			}
+
 			if err != nil {
 				slog.Error("Failed to create cache file", "error", err)
 				http.Error(w, "Internal server error", http.StatusInternalServerError)
 				return
 			}
 			defer cacheFile.Close()
+			if tempPath != "" {
+				defer os.Remove(tempPath)
+			}
 
 			mw := io.MultiWriter(w, cacheFile)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -362,6 +477,12 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 			if err := videop.StreamVideo(ctx, fullStream, mw, opts); err != nil {
 				slog.Error("Streaming video failed", "error", err)
 				return
+			}
+
+			if tempPath != "" {
+				// Upload to Store / Draft
+				cacheFile.Seek(0, 0)
+				saveToStore(context.Background(), actualKey, cacheFile, expiration)
 			}
 			return // Stream finished and sent
 		} else {
@@ -387,11 +508,36 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer cancel()
 
-			if err := videop.ProcessVideo(ctx, tempPath, finalFilePath, opts); err != nil {
+			outputTemp, err := os.CreateTemp("", "resizer_vout_*.mp4")
+			if err != nil {
+				slog.Error("Failed to create output temp file", "error", err)
+				return
+			}
+			outputTempPath := outputTemp.Name()
+			outputTemp.Close()
+			defer os.Remove(outputTempPath)
+
+			if err := videop.ProcessVideo(ctx, tempPath, outputTempPath, opts); err != nil {
 				slog.Error("Chunked video processing failed", "error", err)
 				http.Error(w, "Video processing failed", http.StatusInternalServerError)
 				return
 			}
+
+			// Save from temp to Store / Draft
+			f, err := os.Open(outputTempPath)
+			if err == nil {
+				saveToStore(ctx, actualKey, f, expiration)
+				f.Close()
+			}
+
+			// Serve to client
+			f, err = os.Open(outputTempPath)
+			if err == nil {
+				defer f.Close()
+				w.Header().Set("Content-Type", "video/mp4")
+				io.Copy(w, f)
+			}
+			return
 		}
 	} else {
 		// Image processing using fullStream
@@ -409,23 +555,17 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 			img = imagep.RoundImage(img, radius)
 		}
 
-		if format == "webp" {
-			finalExt = "webp"
-		} else {
-			finalExt = "png"
+		imgExt := format
+		if imgExt == "" {
+			imgExt = "png"
 		}
-		finalFilePath = contentCacheBasePath + "." + finalExt
+		actualKey := filepath.Join(filepath.Dir(u.Path), filenameWithContentID+"."+imgExt)
 
-		outputFile, err := service.Save(dir, finalFilePath)
-		if err != nil {
-			slog.Error("Failed to create image output file", "error", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-
+		// Encode to buffer or temp file
+		buf := new(bytes.Buffer)
 		if format == "webp" {
 			options := webp.Options{Quality: quality}
-			err = webp.Encode(outputFile, img, options)
+			err = webp.Encode(buf, img, options)
 		} else {
 			pngEncoder := png.Encoder{CompressionLevel: png.DefaultCompression}
 			if quality >= 90 {
@@ -433,38 +573,29 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 			} else if quality <= 70 {
 				pngEncoder.CompressionLevel = png.BestCompression
 			}
-			err = pngEncoder.Encode(outputFile, img)
+			err = pngEncoder.Encode(buf, img)
 		}
-		outputFile.Close()
 
 		if err != nil {
 			slog.Error("Failed to encode image", "error", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
+
+		// Save to store / Draft
+		if err := saveToStore(r.Context(), actualKey, buf, expiration); err != nil {
+			slog.Error("Failed to save image to store", "error", err)
+		}
+
+		// Return to client (since it's already in buffer, it's easy)
+		if format == "webp" {
+			w.Header().Set("Content-Type", "image/webp")
+		} else {
+			w.Header().Set("Content-Type", "image/png")
+		}
+		w.Write(buf.Bytes())
+		return
 	}
-
-	processTime := time.Since(startProcess)
-
-	if updateData != "" {
-		service.CreateMeta(dir, updateData)
-	}
-
-	w.Header().Set("X-Download-Time", downloadTime.String())
-	w.Header().Set("X-Processing-Time", processTime.String())
-	if hash := getFileHash(finalFilePath); hash != "" {
-		w.Header().Set("X-Image-Hash", hash)
-	}
-
-	if finalExt == "webp" {
-		w.Header().Set("Content-Type", "image/webp")
-	} else if finalExt == "png" {
-		w.Header().Set("Content-Type", "image/png")
-	} else if finalExt == "mp4" {
-		w.Header().Set("Content-Type", "video/mp4")
-	}
-
-	http.ServeFile(w, r, finalFilePath)
 }
 
 func HashCheckHandler(w http.ResponseWriter, r *http.Request) {
@@ -480,25 +611,20 @@ func HashCheckHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	var matches []match
 
-	// Recursive search in StoragePath
-	err := filepath.Walk(StoragePath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // ignore errors, continue walking
-		}
-		if !info.IsDir() && strings.HasPrefix(info.Name(), hash) {
-			relPath, _ := filepath.Rel(StoragePath, path)
-			matches = append(matches, match{
-				Path: relPath,
-				Size: info.Size(),
-			})
-		}
-		return nil
-	})
-
+	// Store-based search
+	prefix := hash // In S3 we use prefix
+	files, err := GlobalStore.List(r.Context(), prefix)
 	if err != nil {
-		slog.Error("Failed to walk storage path", "error", err)
+		slog.Error("Failed to list storage", "error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
+	}
+
+	for _, name := range files {
+		matches = append(matches, match{
+			Path: name,
+			Size: 0, // We don't have size from List easily without extra calls
+		})
 	}
 
 	response := struct {
@@ -529,31 +655,20 @@ func URLInfoHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Logic to find the directory (same as ResizeHandler)
-	cleanPath := filepath.Clean(u.Path)
-	dir := filepath.Join(StoragePath, filepath.Dir(cleanPath))
-
-	files, err := os.ReadDir(dir)
+	prefix := filepath.Dir(u.Path)
+	files, err := GlobalStore.List(r.Context(), prefix)
 	if err != nil {
-		if os.IsNotExist(err) {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"exists": false,
-				"url":    rawURL,
-			})
-			return
-		}
-		slog.Error("Failed to read dir", "dir", dir, "error", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"exists": false,
+			"url":    rawURL,
+		})
 		return
 	}
 
 	var foundHash string
 	var fileList []string
-	for _, f := range files {
-		if f.IsDir() {
-			continue
-		}
-		name := f.Name()
+	for _, name := range files {
 		// Avoid meta files or internal stuff
 		if strings.HasPrefix(name, ".") || name == "concat_list.txt" {
 			continue
@@ -651,6 +766,146 @@ func dropOldData(folderPath string) {
 		err := os.Remove(filePath)
 		if err != nil {
 			slog.Warn("Error removing file during cleanup", "path", filePath, "error", err)
+		}
+	}
+}
+
+func ConfirmHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	targetPath := r.URL.Query().Get("path")
+	targetHash := r.URL.Query().Get("hash")
+
+	if targetPath == "" && targetHash == "" {
+		http.Error(w, "Parameter 'path' or 'hash' is required", http.StatusBadRequest)
+		return
+	}
+
+	var confirmedPaths []string
+	ctx := r.Context()
+
+	if targetPath != "" {
+		// Confirm specific path
+		draftFile := filepath.Join(DraftPath, targetPath)
+		if err := confirmFile(ctx, targetPath, draftFile); err != nil {
+			if os.IsNotExist(err) {
+				http.Error(w, "Draft not found or expired", http.StatusNotFound)
+				return
+			}
+			slog.Error("Failed to confirm draft by path", "path", targetPath, "error", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+		confirmedPaths = append(confirmedPaths, targetPath)
+	} else if targetHash != "" {
+		// Confirm everything matching hash (recursive search)
+		err := filepath.Walk(DraftPath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() || strings.HasSuffix(path, ".ttl") {
+				return nil
+			}
+
+			if strings.HasPrefix(info.Name(), targetHash) {
+				// Convert absolute local path back to relative storage path
+				relPath, err := filepath.Rel(DraftPath, path)
+				if err != nil {
+					return nil
+				}
+				if err := confirmFile(ctx, relPath, path); err != nil {
+					slog.Warn("Failed to confirm draft during hash sweep", "path", relPath, "error", err)
+					return nil
+				}
+				confirmedPaths = append(confirmedPaths, relPath)
+			}
+			return nil
+		})
+
+		if err != nil {
+			slog.Error("Failed to walk draft directory for hash confirmation", "hash", targetHash, "error", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		if len(confirmedPaths) == 0 {
+			http.Error(w, "No drafts found for this hash", http.StatusNotFound)
+			return
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "confirmed",
+		"hash":      targetHash,
+		"confirmed": confirmedPaths,
+	})
+}
+
+func confirmFile(ctx context.Context, targetPath, draftFile string) error {
+	f, err := os.Open(draftFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// Upload to main GlobalStore
+	if err := GlobalStore.Save(ctx, targetPath, f); err != nil {
+		return err
+	}
+
+	// Remove from local drafts
+	os.Remove(draftFile)
+	os.Remove(draftFile + ".ttl")
+	return nil
+}
+
+func CleanupDrafts() {
+	if !DraftEnabled {
+		return
+	}
+
+	files, err := os.ReadDir(DraftPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		slog.Error("Failed to read draft directory for cleanup", "path", DraftPath, "error", err)
+		return
+	}
+
+	now := time.Now()
+	for _, f := range files {
+		if f.IsDir() || strings.HasSuffix(f.Name(), ".ttl") {
+			continue
+		}
+
+		fullPath := filepath.Join(DraftPath, f.Name())
+		ttlPath := fullPath + ".ttl"
+
+		var expiration time.Time
+		if ttlData, err := os.ReadFile(ttlPath); err == nil {
+			if ts, err := strconv.ParseInt(string(ttlData), 10, 64); err == nil {
+				expiration = time.Unix(ts, 0)
+			}
+		}
+
+		if expiration.IsZero() {
+			info, err := f.Info()
+			if err != nil {
+				continue
+			}
+			expiration = info.ModTime().Add(DraftTTL)
+		}
+
+		if now.After(expiration) {
+			slog.Info("Deleting expired draft", "path", fullPath, "expiration", expiration)
+			os.Remove(fullPath)
+			os.Remove(ttlPath)
 		}
 	}
 }
