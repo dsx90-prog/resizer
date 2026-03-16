@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
-	"image/jpeg"
 	"image/png"
 	"io"
 	"log/slog"
@@ -29,7 +28,6 @@ import (
 
 	"github.com/corona10/goimagehash"
 	"github.com/gen2brain/webp"
-	"github.com/koyachi/go-nude"
 )
 
 var AllowedDomains []string
@@ -50,7 +48,12 @@ var NudeCheckEnabled bool = false
 var FailOnNude bool = true
 var NudeBlurEnabled bool = false
 var NudeBlurStrength int = 50
-var NudeSkinThreshold float64 = 15.0 // % skin pixels to consider nude (go-nude default is 15)
+var NudeThreshold float64 = 0.5 // ML confidence threshold (0.0 - 1.0)
+var BlockedCategories []string = []string{"Porn", "Hentai"}
+var ModelPath string = "models/nsfw_mobilenet.onnx"
+
+var ObjDetectionEnabled bool = false
+var ObjDetectionThreshold float64 = 0.1
 
 type PresetConfig struct {
 	Width   int
@@ -86,93 +89,93 @@ func getFileHash(filePath string) string {
 }
 
 type ImageHashes struct {
-	Average    string    `json:"a_hash"`
-	Perceptual string    `json:"p_hash"`
-	Difference string    `json:"d_hash"`
-	IsNude     bool      `json:"is_nude"`
-	CreatedAt  time.Time `json:"upload_date"`
+	Average         string                   `json:"a_hash"`
+	Perceptual      string                   `json:"p_hash"`
+	Difference      string                   `json:"d_hash"`
+	CreatedAt       time.Time                `json:"upload_date"`
+	IsNude          bool                     `json:"is_nude_internal,omitempty"`
+	Classification  map[string]float64       `json:"nude_classification_internal,omitempty"`
+	DetectedObjects []service.Classification `json:"detected_objects_internal,omitempty"`
 }
 
-func calculateImageHashes(img image.Image, isNude bool) ImageHashes {
+func (h ImageHashes) Clean() map[string]interface{} {
+	return map[string]interface{}{
+		"a_hash":      h.Average,
+		"p_hash":      h.Perceptual,
+		"d_hash":      h.Difference,
+		"upload_date": h.CreatedAt,
+	}
+}
+
+func calculateImageHashes(img image.Image, isNude bool, classification map[string]float64, objects []service.Classification) ImageHashes {
 	aHash, _ := goimagehash.AverageHash(img)
 	pHash, _ := goimagehash.PerceptionHash(img)
 	dHash, _ := goimagehash.DifferenceHash(img)
 
 	return ImageHashes{
-		Average:    aHash.ToString(),
-		Perceptual: pHash.ToString(),
-		Difference: dHash.ToString(),
-		IsNude:     isNude,
-		CreatedAt:  time.Now(),
+		Average:         aHash.ToString(),
+		Perceptual:      pHash.ToString(),
+		Difference:      dHash.ToString(),
+		CreatedAt:       time.Now(),
+		IsNude:          isNude,
+		Classification:  classification,
+		DetectedObjects: objects,
 	}
 }
 
-// isNudeWithThreshold использует go-nude Detector напрямую с кастомным порогом скин-пикселей.
-// Стандартный порог в библиотеке — 15%; здесь можно задать выше, чтобы снизить ложные срабатывания.
-func isNudeWithThreshold(imagePath string, skinThresholdPct float64) (bool, error) {
-	d := nude.NewDetector(imagePath)
-	_, err := d.Parse()
+func populateInfoFromHashes(info map[string]interface{}, hashes ImageHashes) {
+	info["hashes"] = hashes.Clean()
+	info["upload_date"] = hashes.CreatedAt
+	info["is_nude"] = hashes.IsNude
+
+	var descriptionParts []string
+
+	// Find top NSFW category
+	var topNSFW string
+	var maxProb float64
+	for cat, prob := range hashes.Classification {
+		if prob > maxProb {
+			maxProb = prob
+			topNSFW = cat
+		}
+	}
+	if topNSFW != "" {
+		descriptionParts = append(descriptionParts, topNSFW)
+	}
+
+	// Add object labels
+	for _, obj := range hashes.DetectedObjects {
+		descriptionParts = append(descriptionParts, obj.Label)
+	}
+
+	if len(descriptionParts) > 0 {
+		info["description"] = strings.Join(descriptionParts, ", ")
+	}
+}
+
+// isNudeWithML использует предобученную модель ONNX для классификации изображения.
+func isNudeWithML(img image.Image, threshold float64) (bool, map[string]float64, error) {
+	if img == nil {
+		return false, nil, fmt.Errorf("nil image provided")
+	}
+
+	_, probs, err := service.IsNudeML(img, threshold)
 	if err != nil {
-		return false, err
+		slog.Error("ML Nudity check failed", "error", err)
+		return false, nil, err
 	}
 
-	if len(d.SkinRegions) < 3 {
-		return false, nil
-	}
-
-	// Считаем общее кол-во skin-пикселей
-	totalSkin := 0
-	for _, region := range d.SkinRegions {
-		totalSkin += len(region)
-	}
-
-	// Применяем пользовательский порог вместо захардкоженных 15%
-	totalPixels := 0
-	for _, region := range d.SkinRegions {
-		totalPixels += len(region)
-	}
-	// go-nude уже учёл totalPixels внутри, нам нужна оценка через SkinRegions.
-	// Используем метод из библиотеки: отношение skin к полному набору пикселей
-	// недоступно напрямую, поэтому используем skinRegions суммарно vs bound.
-	// Простейшая оценка: если IsNude вернул true, перепроверяем с нашим порогом.
-	//
-	// Альтернативная оценка: запустить parse и прочитать SkinRegions size.
-	// Чем выше skinThresholdPct, тем строже фильтрация.
-	//
-	// Упрощённо: считаем долю skin-пикселей от суммы всех region-пикселей,
-	// но для корректного расчёта нужен totalPixels из Detector (приватное поле).
-	// Поэтому мы запрашиваем анализ через публичный API и корректируем:
-	// если библиотека говорит nude=true, но наш порог выше — отменяем.
-	_ = totalPixels // unused since we use the approach below
-
-	// Реальный подход: смотрим на largest skin region vs all skin pixels
-	// Перебираем регионы чтобы найти самый большой
-	maxRegion := 0
-	for _, region := range d.SkinRegions {
-		if len(region) > maxRegion {
-			maxRegion = len(region)
+	// Check if any of the blocked categories exceed the threshold
+	isBlocked := false
+	for _, cat := range BlockedCategories {
+		if prob, ok := probs[cat]; ok && prob > threshold {
+			isBlocked = true
+			break
 		}
 	}
 
-	if totalSkin == 0 {
-		return false, nil
-	}
-
-	// Ключевая проверка: доля самого большого региона от суммы всех skin-пикселей
-	biggestPct := float64(maxRegion) / float64(totalSkin) * 100
-
-	// go-nude считает nude когда biggest >= 45% от всех skin-пикселей
-	// Мы добавляем дополнительный фильтр через skinThresholdPct:
-	// если порог поднят выше 15, требуем чтобы крупнейший регион
-	// покрывал больший процент изображения.
-	// Перемасштабируем: при threshold=15 — стандартно 45%, при threshold=50 — требуем 75%+
-	adjustedMinBiggest := 45.0 + (skinThresholdPct-15.0)*0.6
-
-	if biggestPct < adjustedMinBiggest {
-		return false, nil
-	}
-
-	return true, nil
+	slog.Info("ML Nudity check result", "is_nude", isBlocked, "probs", probs)
+	return isBlocked, probs, nil
 }
 
 func verifySignature(params url.Values, key string) bool {
@@ -463,7 +466,6 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 						var hashes ImageHashes
 						if err := json.NewDecoder(hashesReader).Decode(&hashes); err == nil {
 							info["hashes"] = hashes
-							info["is_nude"] = hashes.IsNude
 							info["upload_date"] = hashes.CreatedAt
 						}
 					}
@@ -598,9 +600,7 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 					defer reader.Close()
 					var hashes ImageHashes
 					if err := json.NewDecoder(reader).Decode(&hashes); err == nil {
-						info["hashes"] = hashes
-						info["is_nude"] = hashes.IsNude
-						info["upload_date"] = hashes.CreatedAt
+						populateInfoFromHashes(info, hashes)
 					}
 				}
 				if draftExists {
@@ -663,7 +663,7 @@ func ResizeHandler(w http.ResponseWriter, r *http.Request) {
 	processMedia(w, r, fullStream, fileName, actualKey, isVideo, mParams)
 }
 
-func sendJSONInfo(w http.ResponseWriter, storageKey string, isVideo bool, params MediaParams, img image.Image, isNude bool) {
+func sendJSONInfo(w http.ResponseWriter, storageKey string, isVideo bool, params MediaParams, img image.Image, isNude bool, classification map[string]float64, objects []service.Classification) {
 	info := map[string]interface{}{
 		"path":         storageKey,
 		"is_draft":     DraftEnabled || !params.Expiration.IsZero(),
@@ -675,16 +675,43 @@ func sendJSONInfo(w http.ResponseWriter, storageKey string, isVideo bool, params
 		info["draft_expiration"] = params.Expiration
 	}
 
-	if !isVideo && img != nil {
-		hashes := calculateImageHashes(img, isNude)
-		info["hashes"] = hashes
-		info["is_nude"] = isNude
-		info["metadata"] = map[string]interface{}{
-			"width":  img.Bounds().Dx(),
-			"height": img.Bounds().Dy(),
-			"format": params.Format,
+	if !isVideo {
+		if img != nil {
+			hashes := calculateImageHashes(img, isNude, classification, objects)
+			populateInfoFromHashes(info, hashes)
+			info["metadata"] = map[string]interface{}{
+				"width":  img.Bounds().Dx(),
+				"height": img.Bounds().Dy(),
+				"format": params.Format,
+			}
+		} else {
+			// Fallback if img is nil but we have data
+			info["is_nude"] = isNude
+			var descriptionParts []string
+
+			// Top NSFW category
+			var topNSFW string
+			var maxProb float64
+			for cat, prob := range classification {
+				if prob > maxProb {
+					maxProb = prob
+					topNSFW = cat
+				}
+			}
+			if topNSFW != "" {
+				descriptionParts = append(descriptionParts, topNSFW)
+			}
+
+			// Top objects
+			for _, obj := range objects {
+				descriptionParts = append(descriptionParts, obj.Label)
+			}
+
+			if len(descriptionParts) > 0 {
+				info["description"] = strings.Join(descriptionParts, ", ")
+			}
 		}
-	} else if isVideo {
+	} else {
 		info["metadata"] = map[string]interface{}{
 			"width":  params.Width,
 			"height": params.Height,
@@ -752,7 +779,7 @@ func processMedia(w http.ResponseWriter, r *http.Request, stream io.Reader, file
 			}
 
 			if params.Info {
-				sendJSONInfo(w, storageKey, true, params, nil, false)
+				sendJSONInfo(w, storageKey, true, params, nil, false, nil, nil)
 			}
 
 			if tempPath != "" {
@@ -807,7 +834,7 @@ func processMedia(w http.ResponseWriter, r *http.Request, stream io.Reader, file
 			if err == nil {
 				defer f.Close()
 				if params.Info {
-					sendJSONInfo(w, storageKey, true, params, nil, false)
+					sendJSONInfo(w, storageKey, true, params, nil, false, nil, nil)
 				} else {
 					w.Header().Set("Content-Type", "video/mp4")
 					io.Copy(w, f)
@@ -821,56 +848,38 @@ func processMedia(w http.ResponseWriter, r *http.Request, stream io.Reader, file
 		var err error
 		var isNude bool
 
-		if params.NudeCheck {
-			tempFile, err := os.CreateTemp("", "resizer_nude_*.jpg")
-			if err != nil {
-				slog.Error("Failed to create temp file for nude check", "error", err)
-			} else {
-				tempPath := tempFile.Name()
-				defer os.Remove(tempPath)
+		img, err = imagep.DecodeImage(fileName, stream)
+		if err != nil {
+			slog.Error("Failed to decode image", "error", err)
+			http.Error(w, "Failed to decode image", http.StatusBadRequest)
+			return
+		}
 
-				// We need the image object to resize it for better detection accuracy
-				img, err = imagep.DecodeImage(fileName, stream)
-				if err != nil {
-					slog.Error("Failed to decode image for nude check", "error", err)
-					tempFile.Close()
-					http.Error(w, "Failed to decode image", http.StatusBadRequest)
+		var (
+			classification map[string]float64
+			objects        []service.Classification
+		)
+		if params.NudeCheck {
+			isNude, classification, err = isNudeWithML(img, NudeThreshold)
+			if err != nil {
+				slog.Warn("Nudity check failed", "error", err)
+			} else if isNude {
+				w.Header().Set("X-Nude", "true")
+				if params.NudeBlur {
+					w.Header().Set("X-Nude", "blurred")
+				} else if FailOnNude {
+					slog.Info("Nudity detected, blocking request")
+					http.Error(w, "Forbidden: Nudity detected", http.StatusForbidden)
 					return
 				}
-
-				// Resize to ~512px for better detection accuracy if image is large
-				checkImg := img
-				bounds := img.Bounds()
-				if bounds.Dx() > 512 || bounds.Dy() > 512 {
-					checkImg = imagep.ResizedImage(img, 512, 512, "center", "center")
-					slog.Info("Resized image for nude check", "original", fmt.Sprintf("%dx%d", bounds.Dx(), bounds.Dy()))
-				}
-
-				// Save resized image to temp file for go-nude
-				if err := jpeg.Encode(tempFile, checkImg, &jpeg.Options{Quality: 80}); err != nil {
-					slog.Error("Failed to save temp image for nude check", "error", err)
-				}
-				tempFile.Close()
-
-				isNude, err = isNudeWithThreshold(tempPath, NudeSkinThreshold)
-				if err != nil {
-					slog.Warn("Nudity check failed", "error", err)
-				} else if isNude {
-					w.Header().Set("X-Nude", "true")
-					if params.NudeBlur {
-						w.Header().Set("X-Nude", "blurred")
-						slog.Info("Nudity detected, applying blur")
-					} else if FailOnNude {
-						slog.Info("Nudity detected, blocking request")
-						http.Error(w, "Forbidden: Nudity detected", http.StatusForbidden)
-						return
-					} else {
-						slog.Info("Nudity detected, allowing but marking")
-					}
-				}
 			}
-		} else {
-			img, err = imagep.DecodeImage(fileName, stream)
+		}
+
+		if ObjDetectionEnabled {
+			objects, err = service.ClassifyImage(img, ObjDetectionThreshold)
+			if err != nil {
+				slog.Warn("Object detection failed", "error", err)
+			}
 		}
 
 		if err != nil {
@@ -922,7 +931,7 @@ func processMedia(w http.ResponseWriter, r *http.Request, stream io.Reader, file
 			return
 		}
 
-		hashes := calculateImageHashes(img, isNude)
+		hashes := calculateImageHashes(img, isNude, classification, objects)
 		hashesData, _ := json.Marshal(hashes)
 
 		if err := saveToStore(r.Context(), storageKey, bytes.NewReader(buf.Bytes()), params.Expiration); err != nil {
@@ -939,7 +948,7 @@ func processMedia(w http.ResponseWriter, r *http.Request, stream io.Reader, file
 		}
 
 		if params.Info {
-			sendJSONInfo(w, storageKey, false, params, img, isNude)
+			sendJSONInfo(w, storageKey, false, params, img, isNude, classification, objects)
 		} else {
 			w.Write(buf.Bytes())
 		}
@@ -1116,9 +1125,7 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 				defer reader.Close()
 				var hashes ImageHashes
 				if err := json.NewDecoder(reader).Decode(&hashes); err == nil {
-					info["hashes"] = hashes
-					info["is_nude"] = hashes.IsNude
-					info["upload_date"] = hashes.CreatedAt
+					populateInfoFromHashes(info, hashes)
 				}
 			}
 			if draftExists {

@@ -9,7 +9,7 @@ import (
 
 func TestCalculateImageHashes(t *testing.T) {
 	img1 := image.NewRGBA(image.Rect(0, 0, 100, 100))
-	hashes := calculateImageHashes(img1)
+	hashes := calculateImageHashes(img1, false, nil, nil)
 
 	if hashes.Average == "" || hashes.Perceptual == "" || hashes.Difference == "" {
 		t.Errorf("expected all hashes to be non-empty, got %+v", hashes)

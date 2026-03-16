@@ -3,19 +3,20 @@ module resizer
 go 1.25.0
 
 require (
+	github.com/HugoSmits86/nativewebp v1.2.1
 	github.com/aws/aws-sdk-go-v2 v1.41.4
 	github.com/aws/aws-sdk-go-v2/config v1.32.12
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.12
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.97.1
 	github.com/corona10/goimagehash v1.1.0
 	github.com/gen2brain/webp v0.5.5
-	github.com/koyachi/go-nude v0.0.1
+	github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646
+	github.com/yalue/onnxruntime_go v1.27.0
 	golang.org/x/image v0.37.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
-	github.com/HugoSmits86/nativewebp v1.2.1 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.7 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.20 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.20 // indirect
@@ -32,6 +33,5 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.9 // indirect
 	github.com/aws/smithy-go v1.24.2 // indirect
 	github.com/ebitengine/purego v0.8.3 // indirect
-	github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646 // indirect
 	github.com/tetratelabs/wazero v1.9.0 // indirect
 )

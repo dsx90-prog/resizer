@@ -28,12 +28,20 @@ type Config struct {
 			Key       string `yaml:"key"`
 		} `yaml:"signature"`
 		NudeCheck struct {
-			Enabled          bool    `yaml:"enabled"`
-			FailOnNude       bool    `yaml:"fail_on_nude"`
-			NudeBlur         bool    `yaml:"blur_on_nude"`
-			NudeBlurStrength int     `yaml:"blur_strength"`
-			SkinThreshold    float64 `yaml:"skin_threshold"`
+			Enabled           bool     `yaml:"enabled"`
+			FailOnNude        bool     `yaml:"fail_on_nude"`
+			BlurOnNude        bool     `yaml:"blur_on_nude"`
+			BlurStrength      int      `yaml:"blur_strength"`
+			NudeThreshold     float64  `yaml:"nude_threshold"`
+			BlockedCategories []string `yaml:"blocked_categories"`
+			ModelPath         string   `yaml:"model_path"`
 		} `yaml:"nude_check"`
+		ObjectDetection struct {
+			Enabled    bool    `yaml:"enabled"`
+			ModelPath  string  `yaml:"model_path"`
+			LabelsPath string  `yaml:"labels_path"`
+			Threshold  float64 `yaml:"threshold"`
+		} `yaml:"object_detection"`
 	} `yaml:"security"`
 	Storage struct {
 		Type string `yaml:"type"`
@@ -123,11 +131,33 @@ func main() {
 	handlers.StoragePath = cfg.Storage.Path
 	handlers.NudeCheckEnabled = cfg.Security.NudeCheck.Enabled
 	handlers.FailOnNude = cfg.Security.NudeCheck.FailOnNude
-	handlers.NudeBlurEnabled = cfg.Security.NudeCheck.NudeBlur
-	handlers.NudeBlurStrength = cfg.Security.NudeCheck.NudeBlurStrength
-	if cfg.Security.NudeCheck.SkinThreshold > 0 {
-		handlers.NudeSkinThreshold = cfg.Security.NudeCheck.SkinThreshold
+	handlers.NudeBlurEnabled = cfg.Security.NudeCheck.BlurOnNude
+	handlers.NudeBlurStrength = cfg.Security.NudeCheck.BlurStrength
+	if cfg.Security.NudeCheck.NudeThreshold > 0 {
+		handlers.NudeThreshold = cfg.Security.NudeCheck.NudeThreshold
 	}
+	if len(cfg.Security.NudeCheck.BlockedCategories) > 0 {
+		handlers.BlockedCategories = cfg.Security.NudeCheck.BlockedCategories
+	}
+	handlers.ModelPath = cfg.Security.NudeCheck.ModelPath
+
+	handlers.ObjDetectionEnabled = cfg.Security.ObjectDetection.Enabled
+	handlers.ObjDetectionThreshold = cfg.Security.ObjectDetection.Threshold
+
+	// Initialize ONNX
+	if handlers.NudeCheckEnabled {
+		if err := service.InitNSFW(handlers.ModelPath); err != nil {
+			slog.Error("Failed to initialize NSFW ONNX", "error", err)
+			os.Exit(1)
+		}
+	}
+	if handlers.ObjDetectionEnabled {
+		if err := service.InitClassifier(cfg.Security.ObjectDetection.ModelPath, cfg.Security.ObjectDetection.LabelsPath); err != nil {
+			slog.Error("Failed to initialize Classifier ONNX", "error", err)
+			// Maybe non-fatal?
+		}
+	}
+	defer service.CloseONNX()
 
 	// Initialize Storage Provider
 	ctx := context.Background()
